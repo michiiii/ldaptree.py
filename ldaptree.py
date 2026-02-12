@@ -468,11 +468,10 @@ Examples:
   %(prog)s -s 10.10.10.10 -u "user@EXAMPLE.COM" -p "password123"
 
   # With explicit Base DN
-  %(prog)s -s 10.10.10.10 -b "DC=example,DC=com" \\
-           -u "user@EXAMPLE.COM" -p "password123"
+  %(prog)s -s 10.10.10.10 -b "DC=example,DC=com" -u "user@EXAMPLE.COM" -p "password123"
 
   # Verbose mode with debug information
-  %(prog)s -s ldap.example.com -u "domain\\user" -p "password" -v
+  %(prog)s -s ldap.example.com -u "user@EXAMPLE.COM" -p "password" -v
 
   # Save output to file
   %(prog)s -s 192.168.1.100 -u "admin@COMPANY.LOCAL" -p "P@ssw0rd" -o results.txt
