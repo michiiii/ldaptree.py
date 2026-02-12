@@ -3,8 +3,6 @@
 **LDAP organizational unit (OU) enumeration with Group Policy Object (GPO) links.**  
 Connects to an LDAP server (typically Active Directory), discovers the OU tree and domain root, resolves linked GPOs by name, and prints a readable tree with link order, enforced/disabled state, and optional verbose details.
 
-**Author:** Michael Ritter
-
 ---
 
 ## Features
