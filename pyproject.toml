@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ldaptree"
+version = "3.0"
+description = "LDAP OU enumeration with Group Policy links"
+readme = "README.md"
+authors = [
+    { name = "Michael Ritter" }
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+ldaptree = "ldaptree:main"
+
+[tool.setuptools]
+py-modules = ["ldaptree"]
