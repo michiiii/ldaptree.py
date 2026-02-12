@@ -141,8 +141,3 @@ Log and status messages go to **stderr**; the tree itself goes to **stdout** (or
 - The password is passed on the command line and may appear in process lists and shell history; prefer a dedicated test account.
 - **LDAPS** is used by default with **TLS certificate verification disabled**, so it works with typical internal AD (self-signed or internal CA). Use `--ldap` only when you explicitly want unencrypted LDAP (e.g. local lab).
 
----
-
-## License
-
-See repository or author for license terms.
