@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-"ldaptree.py" = "ldaptree:main"
+"ldaptree.py" = "_ldaptree:main"
 
 [tool.setuptools]
-py-modules = ["ldaptree"]
+py-modules = ["_ldaptree"]
