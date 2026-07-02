@@ -85,23 +85,36 @@ def fetch_gpo_names(conn, domain_ncs):
 
 
 def parse_gplinks(gplink_str, gpo_names):
-    """Parse a gPLink attribute string and return (display_name, enabled) tuples.
+    """Parse a gPLink attribute string into an ordered list of GPO-link dicts.
 
     Each token looks like [LDAP://cn={GUID},...;N] where N is a bitmask:
       bit 0 set  → link is disabled
       bit 1 set  → link is enforced (still enabled)
+
+    gPLink lists links left-to-right from LOWEST to HIGHEST precedence, so the
+    last token in the string is link order 1 — the GPO that wins on conflicting
+    settings. We reverse and number the links 1..N so order 1 (highest
+    precedence) is first, matching the GPMC "Linked Group Policy Objects" tab.
+    Enforced links (bit 1) actually override this ordering, but their link-order
+    number is reported unchanged, as GPMC does.
     """
     if not gplink_str:
         return []
     links = []
     for match in re.finditer(r'\[LDAP://([^\]]+?);(\d+)\]', gplink_str, re.IGNORECASE):
-        gpo_dn   = match.group(1)
-        options  = int(match.group(2))
-        enabled  = not bool(options & 1)
-        enforced = " (enforced)" if options & 2 else ""
-        name = gpo_names.get(gpo_dn.lower(), gpo_dn)
-        guid = gpo_dn.split(",")[0][3:]  # CN={GUID} → {GUID}
-        links.append((f"{name} [{guid}]{enforced}", enabled))
+        gpo_dn  = match.group(1)
+        options = int(match.group(2))
+        name    = gpo_names.get(gpo_dn.lower(), gpo_dn)
+        guid    = gpo_dn.split(",")[0][3:]  # CN={GUID} → {GUID}
+        links.append({
+            "name":     name,
+            "guid":     guid,
+            "enabled":  not bool(options & 1),
+            "enforced": bool(options & 2),
+        })
+    links.reverse()  # last token in the string = link order 1 = highest precedence
+    for order, link in enumerate(links, start=1):
+        link["order"] = order
     return links
 
 
@@ -222,9 +235,12 @@ def print_ou(item, depth, extra_indent, out):
         prefix = "+-- " if depth == 0 else "|-- "
         name   = item['name']
     print(f"{indent}{prefix}{name} {GREY}[{item['dn']}]{NC}{format_counts(item)}", file=out)
-    for gpo_name, enabled in item.get("gplinks", []):
-        color = GREEN if enabled else GREY
-        print(f"{indent}    {color}> {gpo_name}{NC}", file=out)
+    for link in item.get("gplinks", []):
+        color = GREEN if link["enabled"] else GREY
+        tag   = f" {YELLOW}(enforced){NC}{color}" if link["enforced"] else ""
+        state = "" if link["enabled"] else " (disabled)"
+        print(f"{indent}    {color}> #{link['order']} {link['name']} "
+              f"[{link['guid']}]{tag}{state}{NC}", file=out)
 
 
 def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):

@@ -75,12 +75,12 @@ Every run produces a full snapshot of the OU tree — no flags needed:
 ```
 LDAP OU Tree Structure
 Base DN: DC=SEVENKINGDOMS,DC=LOCAL
-Total OUs found: 9
+OUs: 9
 ============================================================
 SEVENKINGDOMS.LOCAL [💻 3 👤 17 👥 55]
   +-- Crownlands [OU=Crownlands,DC=sevenkingdoms,DC=local] [💻 0 👤 10 👥 4]
   +-- Domain Controllers [OU=Domain Controllers,DC=sevenkingdoms,DC=local] [💻 1 👤 0 👥 0]
-      > Default Domain Controllers Policy [{6AC1786C-016F-11D2-945F-00C04fB984F9}]
+      > #1 Default Domain Controllers Policy [{6AC1786C-016F-11D2-945F-00C04fB984F9}]
   +-- Dorne [OU=Dorne,DC=sevenkingdoms,DC=local] [💻 0 👤 0 👥 0]
   +-- IronIslands [OU=IronIslands,DC=sevenkingdoms,DC=local] [💻 0 👤 0 👥 0]
   +-- Reach [OU=Reach,DC=sevenkingdoms,DC=local] [💻 0 👤 0 👥 0]
@@ -92,7 +92,7 @@ SEVENKINGDOMS.LOCAL [💻 3 👤 17 👥 55]
 
 **Object counts** `[💻 C  👤 U  👥 G]` are recursive — a parent OU includes all objects beneath it.
 
-**GPO links** are colour-coded: green = enabled, grey = disabled. Enforced links are marked `(enforced)`.
+**GPO links** are listed in precedence order and prefixed with their link order (`#1` = highest precedence, the GPO that wins on conflicting settings — matching the GPMC *Linked Group Policy Objects* tab). They are colour-coded: green = enabled, grey = disabled. Enforced links are marked `(enforced)` in yellow; disabled links are marked `(disabled)`. An enforced link overrides the normal link order, but its number is still reported as GPMC shows it.
 
 **DNs** are shown inline in grey next to each OU name.
 
