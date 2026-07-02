@@ -11,11 +11,8 @@ requires-python = ">=3.8"
 dependencies = [
     "ldap3",
     "pycryptodome",
+    "impacket",      # parses the nTSecurityDescriptor blob for --acl
 ]
-
-[project.optional-dependencies]
-# Needed only for --acl (parsing the nTSecurityDescriptor blob).
-acl = ["impacket"]
 
 [project.scripts]
 "ldaptree.py" = "_ldaptree:main"

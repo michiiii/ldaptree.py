@@ -15,15 +15,7 @@ git clone https://github.com/michiiii/ldaptree.py
 pipx install ./ldaptree.py
 ```
 
-`pycryptodome` is required for NTLM authentication (`-d`) on Python 3.14+ and modern OpenSSL builds that no longer expose MD4. It is installed automatically.
-
-`impacket` is required only for `--acl` (parsing the `nTSecurityDescriptor` blob). It is **not** installed by default — pull it in with the `acl` extra:
-
-```bash
-pipx install 'git+https://github.com/michiiii/ldaptree.py#egg=ldaptree[acl]'
-# or, for a local clone:
-pipx install './ldaptree.py[acl]'
-```
+`pycryptodome` (NTLM auth on Python 3.14+ / modern OpenSSL that no longer exposes MD4) and `impacket` (parsing the `nTSecurityDescriptor` blob for `--acl`) are installed automatically as dependencies.
 
 ## Usage
 
@@ -155,7 +147,7 @@ inlanefreight.local
 
 Creating a GPO requires `CreateChild` on `CN=Policies,CN=System,<domain>`, held by default only by Domain/Enterprise Admins, SYSTEM, and **Group Policy Creator Owners** (GPCO). GPCO is empty by default, so the tool reports two non-default sources: the **transitive members of GPCO** (expanded via `LDAP_MATCHING_RULE_IN_CHAIN`) and any **custom `CreateChild` delegation** on the container (unscoped, or scoped to the `groupPolicyContainer` class). A principal who can create a GPO can then link it wherever they also hold `WriteProperty(gPLink)` — the two findings chain together.
 
-> Reading the DACL is a normal authenticated read — no elevated privilege is needed. The SACL is never requested, so `SeSecurityPrivilege` is not required. Requires the `acl` extra (`impacket`).
+> Reading the DACL is a normal authenticated read — no elevated privilege is needed. The SACL is never requested, so `SeSecurityPrivilege` is not required.
 
 ## Save to file
 

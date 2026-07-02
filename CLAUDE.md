@@ -68,9 +68,10 @@ does. Don't "simplify" the reverse — it encodes the precedence semantics.
 
 ### ACL enumeration (`--acl`)
 
-Optional feature gated on **impacket** (guarded import → `HAS_IMPACKET`; `main()`
-errors out early if `--acl` is passed without it). impacket is an *optional* extra
-in `pyproject.toml` (`[acl]`), matching the "core tree needs only ldap3" stance.
+Feature gated on **impacket** (guarded import → `HAS_IMPACKET`; `main()` errors out
+early if `--acl` is passed without it). impacket is a declared dependency in
+`pyproject.toml`; the guard is defensive for running `_ldaptree.py` straight from a
+checkout without installing.
 
 Data flow, layered onto the existing OU search: when `--acl` is set the main search
 also requests `nTSecurityDescriptor` and passes ldap3's
