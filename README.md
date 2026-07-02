@@ -42,9 +42,18 @@ Only three arguments are required. Everything else is resolved automatically:
 | `-v`, `--verbose` | Verbose logging |
 | `--gc` | Query the Global Catalog (port 3269/3268) for forest-wide enumeration |
 | `--containers` | Include well-known containers (`CN=Users`, `CN=Computers`, …) in the tree |
-| `--acl` | Flag non-default / abusable ACEs on each OU **and each GPO object** (requires impacket) |
+| `--acl` | Flag non-default / abusable ACEs on OUs, GPOs, GPO-creation, and DCSync (requires impacket) |
+| `--vuln` | Kerberoast / AS-REP roast, delegation (unconstrained/constrained/RBCD), weak account flags, and secrets in description fields |
+| `--groups` | *Added* (non-default) transitive members of privileged groups (Domain/Enterprise Admins, operators, DnsAdmins, …) |
+| `--creds` | LAPS local-admin passwords and gMSA managed passwords readable by the current user |
+| `--trusts` | Domain / forest trusts (direction, type, transitivity, SID filtering) |
+| `--computers` | Computer inventory with OS, flagging end-of-life OSes and stale accounts |
+| `--adcs` | AD CS CAs and certificate templates, flagging ESC1/2/3/4/9 (requires impacket) |
+| `-A`, `--all` | Enable every enumeration module above |
 | `--no-ldaps` | Use plain LDAP (port 389/3268) instead of LDAPS |
 | `--version` | Show version |
+
+All the enumeration modules are opt-in and composable — run `-A` for everything, or pick the ones you need. They print as labelled sections after the OU tree; findings are filtered to non-default / abusable configurations so the output is signal, not inventory (except `--computers`, which is inventory by design).
 
 ## Authentication
 
@@ -160,6 +169,72 @@ inlanefreight.local
 DCSync (replicating secrets to dump every password hash, including `krbtgt`) needs **both** the `DS-Replication-Get-Changes` and `DS-Replication-Get-Changes-All` control-access rights on the domain object — or `GenericAll` / all-extended-rights, which grant both. The two rights are unioned per principal even when granted by separate ACEs; anyone holding both (that isn't a default replication principal — DCs, Administrators, SYSTEM, Enterprise DCs, RODCs, DA/EA) is flagged `!!`. Holders of only one right are listed as `partial` for awareness.
 
 > Reading the DACL is a normal authenticated read — no elevated privilege is needed. The SACL is never requested, so `SeSecurityPrivilege` is not required.
+
+## Attack surface (`--vuln`)
+
+`--vuln` sweeps the domain for the most common Kerberos/delegation abuse targets and prints them in a closing section:
+
+```bash
+ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -p $AD_USER_PASS --vuln
+```
+
+```
+Vulnerable / abusable account configurations
+============================================================
+inlanefreight.local
+  Kerberoastable users (SPN set):
+    ◆ svc-sql [MSSQLSvc/sql01.inlanefreight.local:1433  +1 more]
+  AS-REP roastable users (pre-auth not required):
+    ◆ jdoe
+  Unconstrained delegation (non-DC):
+    ‼ WEB01$ (computer)
+  Constrained delegation:
+    ! svc-app (user) [+protocol transition] → cifs/dc01.inlanefreight.local
+  Resource-based constrained delegation (RBCD):
+    ! WS01$ (computer) ← can be acted on by: attacker-svc, helpdesk
+```
+
+What each check looks for:
+
+| Finding | Criterion |
+|---------|-----------|
+| **Kerberoastable** | Enabled user accounts with a `servicePrincipalName`, excluding `krbtgt` and gMSAs (whose keys aren't crackable). Request a TGS and crack the hash offline. |
+| **AS-REP roastable** | Enabled users with `DONT_REQ_PREAUTH` (`userAccountControl` bit `0x400000`). Grab the AS-REP and crack it — no credentials needed. |
+| **Unconstrained delegation** | `TRUSTED_FOR_DELEGATION` (`0x80000`) set and **not** a DC (`SERVER_TRUST_ACCOUNT` clear, not in the DC/RODC primary groups). Compromising the host lets you capture any TGT sent to it. |
+| **Constrained delegation** | `msDS-AllowedToDelegateTo` populated; the target SPNs are shown. `[+protocol transition]` marks `TRUSTED_TO_AUTH_FOR_DELEGATION` (`0x1000000`), which allows impersonating *any* user (S4U2Self). |
+| **RBCD** | `msDS-AllowedToActOnBehalfOfOtherIdentity` populated; the SD is parsed to list the principals that can act on the resource — compromise one of them to take over the account. |
+| **Secrets in fields** | `description` / `info` / `comment` containing a password keyword — a classic instant win. |
+| **Weak account flags** | `PASSWD_NOTREQD` (may accept an empty password) and reversible-encryption (`0x80`, password recoverable in cleartext) — enabled accounts only, excluding the built-in Guest/krbtgt/DefaultAccount which ship with these flags. |
+
+Delegation checks cover both **user and computer** accounts (each is labelled), since constrained delegation on a service *user* account is common; DCs are excluded because their delegation is expected. Roastable accounts that are also `adminCount=1` (privileged) are marked **⭐** — a roastable admin is a crown jewel. `--vuln` is independent of `--acl` and can be combined with it (and with `--gc` for a forest-wide sweep).
+
+## More enumeration modules
+
+| Flag | What you get |
+|------|--------------|
+| `--groups` | Transitive membership (via `LDAP_MATCHING_RULE_IN_CHAIN`) of Domain/Enterprise/Schema Admins, the built-in operators, Cert Publishers, Protected Users, GPCO, and **DnsAdmins** (DLL-load → RCE on a DC). Built-in default members (`Administrator`, the nested admin groups, operators) are filtered out — only *added* principals show, and a group with no added members is omitted. |
+| `--creds` | **LAPS** local-admin passwords (`ms-Mcs-AdmPwd` / `msLAPS-Password`) and **gMSA** managed passwords — confidential attributes only come back when *you* can read them, so anything shown is a credential you can use. Non-readable LAPS hosts are summarised; for gMSAs you can't read, the authorised readers are listed as onward targets. |
+| `--trusts` | Domain/forest trusts with direction (`← → ↔`), type, and `trustAttributes` flags (within-forest, forest-transitive, SID-filtering, non-transitive, …). |
+| `--computers` | Full computer inventory (hostname, OS, last logon) flagging **EOL OSes** and **stale** accounts (>90 days). |
+| `--adcs` | AD CS CAs and certificate templates, flagging **ESC1/2/3/4/9** and non-default control over the CA object (ESC7-ish). |
+
+### AD CS (`--adcs`)
+
+```
+AD CS — certificate authorities & vulnerable templates
+============================================================
+CA: INLANE-CA @ dc01.inlanefreight.local (12 templates published)
+Vulnerable templates: 1
+  UserAuth (enabled) [ESC1]
+    enrollable by: Domain Users
+(ESC6/ESC8/ESC11 need CA registry / HTTP / RPC access — not checked over LDAP)
+```
+
+Each `pKICertificateTemplate` is evaluated from LDAP alone: **ESC1** (enrollee supplies the subject + an authentication EKU + no manager approval + no RA signature + a non-admin can enroll), **ESC2** (Any-Purpose EKU), **ESC3** (Enrollment-Agent EKU), **ESC4** (a **low-privileged** principal has object-wide write — GenericAll/GenericWrite/WriteDacl/WriteOwner — over the template), and **ESC9** (`CT_FLAG_NO_SECURITY_EXTENSION`). "Enrollable by" and "writable by" come from parsing each template's DACL (the `Certificate-Enrollment` extended right).
+
+ESC4 and the ESC7 CA-object check are deliberately restricted to **low-privileged** trustees (Everyone / Authenticated Users / Domain Users / Domain Computers / Users). Admins and the CA's own host machine account hold these rights on the built-in templates *by default*, so flagging them would bury real findings in noise — a single-attribute `WriteProperty` is likewise not treated as ESC4. The trade-off: a delegation to a **custom** (non-low-priv) group won't show; run [Certipy](https://github.com/ly4k/Certipy) for exhaustive template-ACL analysis, and to confirm/exploit ESC6/ESC8/ESC11 (which depend on CA registry / HTTP / RPC state and aren't LDAP-observable).
+
+> The modules that parse security descriptors (`--acl`, `--adcs`) need impacket; the rest are pure LDAP reads.
 
 ## Save to file
 

@@ -143,6 +143,78 @@ All four `--acl` sections (OU ACEs, GPO ACEs, GPO-creation, DCSync) print via th
 `emit()` helper so `-o` file output and stdout stay identical; each has an
 `x = []` init before the `if args.acl:` block so `emit()` never NameErrors.
 
+### Attack surface (`--vuln`) — independent of `--acl`
+
+`fetch_vuln()` runs five per-domain LDAP searches; `print_vuln()` renders them. It is
+gated on its own flag (not `--acl`) and does **not** require impacket except for
+resolving RBCD trustees — `_rbcd_principals()` swallows a NameError if impacket is
+absent, so `--vuln` still lists the RBCD accounts, just without the "acted on by"
+names. The searches key off `userAccountControl` via the bitwise-AND matching rule
+(`LDAP_MATCHING_RULE_BIT_AND` = `1.2.840.113556.1.4.803`): AS-REP = `0x400000`,
+unconstrained = `0x80000` with `SERVER_TRUST_ACCOUNT 0x2000` cleared (plus
+primaryGroupID 516/521 excluded) to drop DCs/RODCs, constrained = presence of
+`msDS-AllowedToDelegateTo` with `0x1000000` flagging protocol transition, RBCD =
+presence of `msDS-AllowedToActOnBehalfOfOtherIdentity` (an SD blob, parsed like any
+DACL). Kerberoast filters on `sAMAccountType=805306368` (user, not computer) with an
+SPN, minus krbtgt and gMSAs. Delegation checks intentionally cover users **and**
+computers (labelled), since constrained delegation on service *user* accounts is the
+common case. Filters are assembled with f-strings — the mock-conn paren-balance test
+in the harness is the guard against interpolation typos. Note: searches are not paged
+(consistent with the rest of the tool), so very large result sets hit the server's
+size limit — raise paging here if a domain has >1000 kerberoastable users.
+
+### The other enumeration modules
+
+All follow the same shape: an independent `--flag`, a `fetch_x()` returning per-domain
+dicts, a `print_x()`, an `x_info = []` init before its `if args.x:` block, and a
+`print_x(...)` line in `emit()`. `-A/--all` just sets every flag. Add a new module by
+copying that pattern; the mock-conn filter test + a synthetic-SD/render test is the
+verification recipe (no live DC needed).
+
+- **`--groups`** (`fetch_priv_groups`) — resolves each entry of `PRIV_GROUPS` to a DN
+  (by RID for domain groups, fixed SID for built-ins, sAMAccountName for DnsAdmins,
+  which has no fixed RID) then expands transitively with the same in-chain rule as
+  GPCO. Members are filtered through `is_default_privileged()` so built-in defaults
+  (Administrator RID 500, the nested DA/EA/Administrators, operators) drop out — only
+  *added* principals show, and a group left with no members is omitted. This needs the
+  member `objectSid`, so the member search requests it.
+- **`--creds`** (`fetch_creds`) — LAPS/gMSA passwords are *confidential* attributes:
+  the DC only returns them if the caller can read them, so presence == "you can read
+  this". LAPS deployment is detected via the world-readable `…ExpirationTime` so we can
+  also count deployed-but-locked hosts. gMSA `msDS-GroupMSAMembership` is an SD parsed
+  by the same `_rbcd_principals()` used for RBCD.
+- **`--trusts` / `--computers`** — pure LDAP. `_last_logon()` must handle both a raw
+  Windows FILETIME int *and* an already-parsed `datetime` (ldap3 formats it when the
+  schema is loaded via `get_info=ALL`). `EOL_OS_MARKERS` is a static heuristic — update
+  it as OSes age (Windows 10 is on it as of 2026).
+
+### AD CS / ESC (`--adcs`) — needs impacket, guarded with `--acl`
+
+`fetch_adcs()` reads the Configuration NC (`configurationNamingContext`, or derived as
+`CN=Configuration,<rootDomainNamingContext>`): `pKIEnrollmentService` objects (CAs, with
+their published `certificateTemplates`) and `pKICertificateTemplate` objects. Template
+DACLs are parsed by `template_sd_rights()` → (enrollers, writers), keying enrollment off
+the `Certificate-Enrollment` extended-right GUID (`CERT_ENROLL_GUID`) plus GenericAll.
+`_evaluate_template()` maps attributes to ESC labels: ESC1 needs *all* of
+enrollee-supplies-subject + auth-EKU + no-approval + no-RA-sig + a non-default enroller;
+ESC2/3 by EKU; ESC4 from *low-priv* writers; ESC9 from the no-security-extension bit.
+`present` is set true if either the CA or template container was readable. ESC6/8/11 are
+deliberately out of scope (not LDAP-observable) and the printer says so — don't add them
+as false "clear" signals.
+
+**ESC4 and ESC7 gate on `is_low_priv()`, not `is_default_privileged()`.** This was a
+real false-positive bug: the built-in default templates (User, Computer, Basic EFS, …)
+grant object-wide write only to DA/EA and grant broad principals at most a scoped
+`WriteProperty`, and the CA object is controlled by the CA's own host machine account
+(e.g. `DC04$`). "Non-default" let all of those through. So `template_sd_rights()` counts
+only object-wide writes (GenericAll/GenericWrite/WriteDacl/WriteOwner — **not**
+WriteProperty), and ESC4/ESC7 fire only when the writer is a genuinely low-privileged,
+attacker-reachable principal (`LOW_PRIV_SIDS`/`LOW_PRIV_RIDS`: Everyone, Auth Users,
+Domain Users/Computers, Users, Guests). Cost: a delegation to a *custom* admin group is
+not flagged — an accepted trade to keep the section signal-only. The synthetic-SD +
+`_evaluate_template` truth-table test (default-template scenario must yield no ESC4) is
+what protects this.
+
 **Recursive counts are computed client-side, not by the server.** `fetch_counts()`
 does one subtree search per object class and buckets each hit by its *immediate*
 parent DN. `recursive_count()` then sums a container plus everything whose DN ends
