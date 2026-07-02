@@ -8,9 +8,19 @@ from collections import defaultdict
 try:
     from ldap3 import Server, Connection, ALL, NONE, SUBTREE, BASE, NTLM, SIMPLE
     from ldap3.core.exceptions import LDAPException
+    from ldap3.protocol.microsoft import security_descriptor_control
 except ImportError:
     print("ERROR: ldap3 is required. Install it with: pip install ldap3", file=sys.stderr)
     sys.exit(1)
+
+# impacket is only needed for --acl (parsing the nTSecurityDescriptor blob).
+try:
+    from impacket.ldap.ldaptypes import (
+        SR_SECURITY_DESCRIPTOR, ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_OBJECT_ACE)
+    from impacket.uuid import bin_to_string
+    HAS_IMPACKET = True
+except ImportError:
+    HAS_IMPACKET = False
 
 VERSION = "2.0"
 
@@ -118,6 +128,224 @@ def parse_gplinks(gplink_str, gpo_names):
     return links
 
 
+# --- ACL enumeration -------------------------------------------------------
+#
+# Active Directory access-right bits (ADS_RIGHT_*). We only care about the
+# rights that let a principal take over or restructure an OU (and everything
+# beneath it), not read/list rights.
+ACE_DS_CREATE_CHILD   = 0x00000001
+ACE_DS_DELETE_CHILD   = 0x00000002
+ACE_DS_SELF           = 0x00000008
+ACE_DS_WRITE_PROP     = 0x00000020
+ACE_DS_DELETE_TREE    = 0x00000040
+ACE_DS_CONTROL_ACCESS = 0x00000100
+ACE_DELETE            = 0x00010000
+ACE_WRITE_DACL        = 0x00040000
+ACE_WRITE_OWNER       = 0x00080000
+ACE_GENERIC_ALL       = 0x10000000
+ACE_GENERIC_WRITE     = 0x40000000
+ACE_FULL_CONTROL      = 0x000F01FF  # all specific+standard rights set (== GenericAll)
+
+ACE_INHERITED = 0x10  # AceFlags bit: this ACE was inherited from a parent
+
+# schemaIDGUIDs of attributes whose write is itself an attack primitive on an
+# OU. gPLink is the big one: writing it links an attacker-controlled GPO to the
+# OU and thus code-execs every computer/user beneath it.
+KNOWN_OBJECT_GUIDS = {
+    "f30e3bbe-9ff0-11d1-b603-0000f80367c1": "gPLink",
+}
+
+# Built-in principals that hold these rights on OUs by *default* — either Tier-0
+# admins or the operator groups AD delegates object create/delete to out of the
+# box (this is why Account Operators shows CreateChild/DeleteChild on every OU).
+# Their per-OU ACEs are noise; their risk is group membership, not a delegation.
+# Everything else with a dangerous right is surfaced.
+DEFAULT_PRIVILEGED_SIDS = {
+    "S-1-5-18",      # Local System
+    "S-1-5-10",      # SELF (principal self)
+    "S-1-3-0",       # Creator Owner
+    "S-1-5-9",       # Enterprise Domain Controllers
+    "S-1-5-32-544",  # Administrators
+    "S-1-5-32-548",  # Account Operators (default create/delete of users/groups/computers)
+    "S-1-5-32-549",  # Server Operators
+    "S-1-5-32-550",  # Print Operators   (default create/delete of printQueue objects)
+    "S-1-5-32-551",  # Backup Operators
+}
+# Domain-relative RIDs of default Tier-0 groups/accounts.
+DEFAULT_PRIVILEGED_RIDS = {
+    500,  # Administrator
+    512,  # Domain Admins
+    516,  # Domain Controllers
+    518,  # Schema Admins
+    519,  # Enterprise Admins
+    521,  # Read-only Domain Controllers
+    498,  # Enterprise Read-only Domain Controllers
+}
+
+WELL_KNOWN_SIDS = {
+    "S-1-1-0":        "Everyone",
+    "S-1-3-0":        "Creator Owner",
+    "S-1-5-7":        "Anonymous",
+    "S-1-5-9":        "Enterprise Domain Controllers",
+    "S-1-5-10":       "SELF",
+    "S-1-5-11":       "Authenticated Users",
+    "S-1-5-18":       "Local System",
+    "S-1-5-32-544":   "Administrators",
+    "S-1-5-32-545":   "Users",
+    "S-1-5-32-548":   "Account Operators",
+    "S-1-5-32-549":   "Server Operators",
+    "S-1-5-32-550":   "Print Operators",
+    "S-1-5-32-551":   "Backup Operators",
+    "S-1-5-32-554":   "Pre-Windows 2000 Compatible Access",
+    "S-1-5-32-555":   "Remote Desktop Users",
+}
+
+
+def is_default_privileged(sid):
+    """True if sid is a built-in Tier-0 principal that owns OUs by default."""
+    if sid in DEFAULT_PRIVILEGED_SIDS:
+        return True
+    rid = sid.rsplit("-", 1)[-1]
+    return rid.isdigit() and int(rid) in DEFAULT_PRIVILEGED_RIDS
+
+
+def interpret_access_mask(mask, obj_guid, obj_label):
+    """Return the list of *dangerous* right labels present in an access mask.
+
+    obj_guid/obj_label describe an object-scoped ACE's target attribute or
+    extended right (None for ACEs that cover the whole object). Property/
+    extended-right writes are only reported when unscoped (all attributes) or
+    scoped to a known-dangerous attribute — a delegated write to one benign
+    attribute is not flagged.
+    """
+    if mask & ACE_GENERIC_ALL or (mask & ACE_FULL_CONTROL) == ACE_FULL_CONTROL:
+        return ["GenericAll"]
+    rights = []
+    if mask & ACE_WRITE_DACL:      rights.append("WriteDacl")
+    if mask & ACE_WRITE_OWNER:     rights.append("WriteOwner")
+    if mask & ACE_GENERIC_WRITE:   rights.append("GenericWrite")
+    if mask & ACE_DS_CREATE_CHILD: rights.append("CreateChild")
+    if mask & ACE_DS_DELETE_CHILD: rights.append("DeleteChild")
+    if mask & ACE_DS_DELETE_TREE:  rights.append("DeleteTree")
+    if mask & ACE_DELETE:          rights.append("Delete")
+    if mask & ACE_DS_WRITE_PROP:
+        if obj_guid is None:
+            rights.append("WriteProperty(All)")
+        elif obj_guid in KNOWN_OBJECT_GUIDS:
+            rights.append(f"WriteProperty({obj_label})")
+        # scoped to a benign single attribute → not a takeover primitive, skip
+    if mask & ACE_DS_CONTROL_ACCESS and obj_guid is None:
+        rights.append("AllExtendedRights")
+    return rights
+
+
+def analyze_sd(sd_bytes):
+    """Parse an nTSecurityDescriptor blob → (owner_sid, [(sid, rights, inherited)]).
+
+    Only ALLOW aces granting a dangerous right to a non-default principal are
+    returned. owner_sid is included so the caller can flag a non-default owner
+    (an owner holds implicit WriteDacl).
+    """
+    sd = SR_SECURITY_DESCRIPTOR(data=sd_bytes)
+    owner_sid = None
+    try:
+        owner_sid = sd["OwnerSid"].formatCanonical()
+    except Exception:
+        pass
+
+    results = []
+    dacl = sd["Dacl"]
+    if not dacl:
+        return owner_sid, results
+
+    for ace in dacl["Data"]:
+        if ace["AceType"] not in (ACCESS_ALLOWED_ACE.ACE_TYPE,
+                                  ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE):
+            continue  # skip DENY aces and audit aces
+        body = ace["Ace"]
+        sid  = body["Sid"].formatCanonical()
+        if is_default_privileged(sid):
+            continue
+
+        obj_guid = None
+        if ace["AceType"] == ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE:
+            if body["Flags"] & ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT:
+                obj_guid = bin_to_string(body["ObjectType"]).lower()
+        obj_label = KNOWN_OBJECT_GUIDS.get(obj_guid,
+                                           obj_guid[:8] if obj_guid else None)
+
+        rights = interpret_access_mask(body["Mask"]["Mask"], obj_guid, obj_label)
+        if not rights:
+            continue
+        results.append((sid, rights, bool(ace["AceFlags"] & ACE_INHERITED)))
+
+    return owner_sid, results
+
+
+def resolve_sid(conn, sid, search_base, cache):
+    """Resolve a SID to a readable name (well-known table, then LDAP lookup)."""
+    if sid in cache:
+        return cache[sid]
+    name = WELL_KNOWN_SIDS.get(sid)
+    if not name and search_base:
+        try:
+            conn.search(search_base, f"(objectSid={sid})",
+                        search_scope=SUBTREE, attributes=["sAMAccountName"])
+            if conn.entries:
+                val = conn.entries[0]["sAMAccountName"].value
+                if val:
+                    name = str(val)
+        except LDAPException:
+            pass
+    name = name or sid
+    cache[sid] = name
+    return name
+
+
+def enrich_acls(conn, ou_data, search_base):
+    """Attach an "acl" list of interesting-ACE dicts to each OU item.
+
+    ACEs are aggregated per trustee: a principal that appears in several ACEs
+    (e.g. object-scoped CreateChild for user/group/computer as separate ACEs) is
+    shown once with the union of its rights. A trustee is marked (inherited) only
+    if *every* one of its dangerous ACEs is inherited.
+    """
+    cache = {}
+    for item in ou_data:
+        raw = item.pop("_sd_raw", None)
+        item["acl"] = []
+        if not raw:
+            continue
+        try:
+            owner_sid, aces = analyze_sd(raw)
+        except Exception:
+            continue
+
+        if owner_sid and not is_default_privileged(owner_sid):
+            item["acl"].append({
+                "who":       resolve_sid(conn, owner_sid, search_base, cache),
+                "rights":    ["Owner"],
+                "inherited": False,
+            })
+
+        agg   = {}   # sid -> {"rights": [...], "inherited": bool}
+        order = []   # preserve first-seen order
+        for sid, rights, inherited in aces:
+            if sid not in agg:
+                agg[sid] = {"rights": [], "inherited": True}
+                order.append(sid)
+            for r in rights:
+                if r not in agg[sid]["rights"]:
+                    agg[sid]["rights"].append(r)
+            agg[sid]["inherited"] &= inherited
+        for sid in order:
+            item["acl"].append({
+                "who":       resolve_sid(conn, sid, search_base, cache),
+                "rights":    agg[sid]["rights"],
+                "inherited": agg[sid]["inherited"],
+            })
+
+
 def query_rootdse(server):
     """Return rootDSE attributes from an anonymous query, or {}."""
     try:
@@ -199,7 +427,7 @@ _EXCLUDED_ROOTS = {
 }
 
 
-def build_tree(entries, with_gplink=False):
+def build_tree(entries, with_gplink=False, with_acl=False):
     ou_data = []
     for e in entries:
         dn    = str(e.entry_dn)
@@ -222,6 +450,11 @@ def build_tree(entries, with_gplink=False):
                 item["_gplink_raw"] = str(e["gPLink"].value or "")
             except Exception:
                 item["_gplink_raw"] = ""
+        if with_acl:
+            try:
+                item["_sd_raw"] = e["nTSecurityDescriptor"].raw_values[0]
+            except Exception:
+                item["_sd_raw"] = None
         ou_data.append(item)
     return ou_data
 
@@ -241,6 +474,10 @@ def print_ou(item, depth, extra_indent, out):
         state = "" if link["enabled"] else " (disabled)"
         print(f"{indent}    {color}> #{link['order']} {link['name']} "
               f"[{link['guid']}]{tag}{state}{NC}", file=out)
+    for ace in item.get("acl", []):
+        rights = ", ".join(ace["rights"])
+        inh    = f" {GREY}(inherited){NC}{RED}" if ace["inherited"] else ""
+        print(f"{indent}    {RED}! {rights} → {ace['who']}{inh}{NC}", file=out)
 
 
 def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
@@ -292,9 +529,14 @@ def main():
     parser.add_argument("-v", "--verbose",  action="store_true",             help="Verbose logging")
     parser.add_argument("--gc",             action="store_true",             help="Query the Global Catalog (port 3269/3268) for forest-wide enumeration")
     parser.add_argument("--containers",     action="store_true",             help="Include well-known containers (CN=Users, CN=Computers, etc.) in the tree")
+    parser.add_argument("--acl",            action="store_true",             help="Flag non-default/abusable ACEs on each OU (owner, WriteDacl/WriteOwner, GenericAll/Write, Create/DeleteChild, WriteProperty on gPLink, ...). Requires impacket")
     parser.add_argument("--no-ldaps",       action="store_true",             help="Use plain LDAP (port 389/3268) instead of LDAPS")
     parser.add_argument("--version",        action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
+
+    if args.acl and not HAS_IMPACKET:
+        log_error("--acl requires impacket. Install it with: pip install impacket")
+        sys.exit(1)
 
     if args.verbose:
         print(f"{BLUE}╔═══════════════════════════════════╗")
@@ -371,18 +613,26 @@ def main():
         if args.containers else
         "(objectClass=organizationalUnit)"
     )
+    ou_attrs = ["gPLink"]
+    # Request DACL + Owner only (SD flags 0x05); asking for the SACL would need
+    # SeSecurityPrivilege and fail for a normal user.
+    sd_controls = None
+    if args.acl:
+        ou_attrs.append("nTSecurityDescriptor")
+        sd_controls = security_descriptor_control(sdflags=0x05)
     try:
         conn.search(
             search_base=args.base_dn,
             search_filter=ldap_filter,
             search_scope=SUBTREE,
-            attributes=["gPLink"],
+            attributes=ou_attrs,
+            controls=sd_controls,
         )
     except LDAPException as e:
         log_error(f"LDAP search failed: {e}")
         sys.exit(1)
 
-    ou_data = build_tree(conn.entries, with_gplink=True)
+    ou_data = build_tree(conn.entries, with_gplink=True, with_acl=args.acl)
     log_verbose(f"Found {len(ou_data)} organizational units", args.verbose)
 
     # Root node
@@ -411,6 +661,15 @@ def main():
     log_verbose(f"Found {len(gpo_names)} GPOs", args.verbose)
     for item in ou_data:
         item["gplinks"] = parse_gplinks(item.pop("_gplink_raw", ""), gpo_names)
+
+    if args.acl:
+        log_verbose("Analyzing OU security descriptors for non-default ACEs", args.verbose)
+        # Resolve trustee SIDs against the DC's own domain NC (rootDSE default).
+        acl_base = rootdse.get("defaultNamingContext") or args.base_dn or (
+            naming_contexts[0] if naming_contexts else "")
+        enrich_acls(conn, ou_data, acl_base)
+        n_flagged = sum(1 for i in ou_data if i.get("acl"))
+        log_verbose(f"Flagged interesting ACEs on {n_flagged} OUs", args.verbose)
 
     for count_key, ldap_filter in [
         ("computer_count", "(objectClass=computer)"),

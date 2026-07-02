@@ -17,6 +17,14 @@ pipx install ./ldaptree.py
 
 `pycryptodome` is required for NTLM authentication (`-d`) on Python 3.14+ and modern OpenSSL builds that no longer expose MD4. It is installed automatically.
 
+`impacket` is required only for `--acl` (parsing the `nTSecurityDescriptor` blob). It is **not** installed by default — pull it in with the `acl` extra:
+
+```bash
+pipx install 'git+https://github.com/michiiii/ldaptree.py#egg=ldaptree[acl]'
+# or, for a local clone:
+pipx install './ldaptree.py[acl]'
+```
+
 ## Usage
 
 ```bash
@@ -41,6 +49,8 @@ Only three arguments are required. Everything else is resolved automatically:
 | `-o`, `--output` | Save output to file |
 | `-v`, `--verbose` | Verbose logging |
 | `--gc` | Query the Global Catalog (port 3269/3268) for forest-wide enumeration |
+| `--containers` | Include well-known containers (`CN=Users`, `CN=Computers`, …) in the tree |
+| `--acl` | Flag non-default / abusable ACEs on each OU (requires impacket) |
 | `--no-ldaps` | Use plain LDAP (port 389/3268) instead of LDAPS |
 | `--version` | Show version |
 
@@ -95,6 +105,29 @@ SEVENKINGDOMS.LOCAL [💻 3 👤 17 👥 55]
 **GPO links** are listed in precedence order and prefixed with their link order (`#1` = highest precedence, the GPO that wins on conflicting settings — matching the GPMC *Linked Group Policy Objects* tab). They are colour-coded: green = enabled, grey = disabled. Enforced links are marked `(enforced)` in yellow; disabled links are marked `(disabled)`. An enforced link overrides the normal link order, but its number is still reported as GPMC shows it.
 
 **DNs** are shown inline in grey next to each OU name.
+
+## Non-default ACLs (`--acl`)
+
+`--acl` reads each OU's `nTSecurityDescriptor` (DACL + owner) and flags access-control entries that grant a principal the ability to **take over or restructure the OU** — and, through GPO linking, everything beneath it:
+
+```bash
+ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -p $AD_USER_PASS --acl
+```
+
+```
+  +-- Crownlands [OU=Crownlands,DC=sevenkingdoms,DC=local] [💻 0 👤 10 👥 4]
+      ! GenericAll → helpdesk
+      ! WriteProperty(gPLink) → jon.snow
+      ! WriteOwner → backup-svc (inherited)
+```
+
+Rights surfaced: `Owner` (non-default), `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner`, `CreateChild`, `DeleteChild`, `DeleteTree`, `Delete`, `WriteProperty(All)`, `AllExtendedRights`, and — most importantly — **`WriteProperty(gPLink)`**, which lets the trustee link an attacker-controlled GPO to the OU and thus run code on every computer/user under it. Inherited ACEs are marked `(inherited)`.
+
+To keep the output to genuine delegations, ACEs held by built-in principals that hold rights on every OU **by default** are not shown — both Tier-0 admins (SYSTEM, Administrators, Domain/Enterprise Admins, Domain Controllers, Enterprise Domain Controllers, Creator Owner, Schema Admins, RODCs, `SELF`) and the operator groups AD delegates object create/delete to out of the box (**Account Operators**, Server/Print/Backup Operators — their risk is group membership, not a per-OU delegation). A delegated write scoped to a single benign attribute is also skipped; only object-wide rights and writes to attack-relevant attributes (`gPLink`) are flagged.
+
+Rights are aggregated per trustee: a principal that appears in several ACEs (AD often splits `CreateChild` into one object-scoped ACE per child class) is shown once with the union of its rights, marked `(inherited)` only if *every* one of its ACEs is inherited.
+
+> Reading the DACL is a normal authenticated read — no elevated privilege is needed. The SACL is never requested, so `SeSecurityPrivilege` is not required. Requires the `acl` extra (`impacket`).
 
 ## Save to file
 

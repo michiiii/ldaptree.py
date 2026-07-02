@@ -66,6 +66,46 @@ the tree prints them highest-precedence-first (`> #1 ...`). Enforced links (bit 
 actually override this ordering, but their number is reported unchanged, as GPMC
 does. Don't "simplify" the reverse — it encodes the precedence semantics.
 
+### ACL enumeration (`--acl`)
+
+Optional feature gated on **impacket** (guarded import → `HAS_IMPACKET`; `main()`
+errors out early if `--acl` is passed without it). impacket is an *optional* extra
+in `pyproject.toml` (`[acl]`), matching the "core tree needs only ldap3" stance.
+
+Data flow, layered onto the existing OU search: when `--acl` is set the main search
+also requests `nTSecurityDescriptor` and passes ldap3's
+`security_descriptor_control(sdflags=0x05)` — **DACL + Owner only**. Never request
+the SACL (0x08); it needs `SeSecurityPrivilege` and would fail for a normal bind.
+`build_tree(with_acl=True)` stashes the raw SD bytes; `enrich_acls()` then parses
+each via `analyze_sd()` (impacket `SR_SECURITY_DESCRIPTOR`) and resolves trustee
+SIDs with `resolve_sid()` (well-known table → `(objectSid=…)` LDAP lookup, cached).
+
+Two deliberate filters define "non-default", and both are load-bearing — loosening
+them floods the output with noise, tightening them hides real delegations:
+- **`is_default_privileged(sid)`** drops ACEs held by built-in principals that
+  have rights on OUs by default: Tier-0 admins (SYSTEM, Administrators, Creator
+  Owner, Enterprise DCs, `SELF`, domain RIDs 512/516/518/519/521/498/500) **and
+  the operator groups** (Account/Server/Print/Backup Operators, `S-1-5-32-548..551`).
+  Account Operators in particular has default CreateChild/DeleteChild on user/
+  group/computer classes on every OU — omitting it was the bug that made the first
+  cut of `--acl` report default ACEs as findings. Everyone else is shown.
+- **`enrich_acls()` aggregates per trustee.** AD splits one logical delegation into
+  several object-scoped ACEs (e.g. CreateChild per child class), so findings are
+  unioned per SID into a single line; `(inherited)` is shown only when *all* of a
+  trustee's ACEs are inherited. Don't revert to one-line-per-ACE — it produces the
+  duplicate rows that hid the real finding.
+- **`interpret_access_mask()`** returns only takeover-grade rights. Full control
+  collapses to `GenericAll`. Property/extended-right writes are reported only when
+  *unscoped* (all attributes) or scoped to a known-dangerous attribute — the only
+  entry in `KNOWN_OBJECT_GUIDS` is **gPLink** (`f30e3bbe-…`), whose write is the
+  GPO-link takeover primitive. A write scoped to one benign attribute is ignored.
+
+Only ALLOW aces are considered (DENY/audit skipped). Owner is surfaced separately
+when non-default (an owner has implicit WriteDacl). The synthetic-SD round-trip in
+the test harness (build with impacket → `analyze_sd`) is the way to verify changes
+here without a live DC — GUID decoding via `bin_to_string` must stay lowercase to
+match `KNOWN_OBJECT_GUIDS` keys.
+
 **Recursive counts are computed client-side, not by the server.** `fetch_counts()`
 does one subtree search per object class and buckets each hit by its *immediate*
 parent DN. `recursive_count()` then sums a container plus everything whose DN ends

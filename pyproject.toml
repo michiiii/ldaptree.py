@@ -13,6 +13,10 @@ dependencies = [
     "pycryptodome",
 ]
 
+[project.optional-dependencies]
+# Needed only for --acl (parsing the nTSecurityDescriptor blob).
+acl = ["impacket"]
+
 [project.scripts]
 "ldaptree.py" = "_ldaptree:main"
 
