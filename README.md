@@ -208,6 +208,17 @@ What each check looks for:
 
 Delegation checks cover both **user and computer** accounts (each is labelled), since constrained delegation on a service *user* account is common; DCs are excluded because their delegation is expected. Roastable accounts that are also `adminCount=1` (privileged) are marked **⭐** — a roastable admin is a crown jewel. `--vuln` is independent of `--acl` and can be combined with it (and with `--gc` for a forest-wide sweep).
 
+With `--vuln`, the vulnerable objects are **also placed inline in the OU tree**, under the OU that contains them, so you can see *where* each finding lives:
+
+```
+  +-- Servers [OU=Servers,DC=inlanefreight,DC=local] [💻 3 👤 0 👥 0]
+      ⚠ WEB01$ (computer) [unconstrained-deleg]
+      +-- DB [OU=DB,OU=Servers,DC=inlanefreight,DC=local] [💻 1 👤 2 👥 0]
+          ⚠ svc-sql (user) [kerberoastable] ⭐adminCount
+```
+
+Each object is shown once with all of its labels aggregated; objects in containers that aren't displayed (e.g. `CN=Users`) attach to the nearest ancestor shown — usually the domain root. The flat section above remains the detailed view (SPNs, delegation targets, RBCD principals, secret values).
+
 ## More enumeration modules
 
 | Flag | What you get |

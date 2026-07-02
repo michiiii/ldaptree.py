@@ -689,7 +689,8 @@ def fetch_vuln(conn, domain_ncs, cache):
     for nc in domain_ncs:
         d = {"domain": domain_from_base_dn(nc), "kerberoastable": [], "asrep": [],
              "unconstrained": [], "constrained": [], "rbcd": [],
-             "secrets": [], "passwd_notreqd": [], "reversible": [], "admincount": set()}
+             "secrets": [], "passwd_notreqd": [], "reversible": [], "admincount": set(),
+             "objects": {}}
 
         def _search(flt, attrs):
             try:
@@ -697,6 +698,19 @@ def fetch_vuln(conn, domain_ncs, cache):
                 return list(conn.entries)
             except LDAPException:
                 return []
+
+        def _add(e, label, kind):
+            # aggregate every finding per object DN, so the OU tree can show each
+            # vulnerable object once with all its labels
+            dn  = str(e.entry_dn)
+            key = dn.lower()
+            o   = d["objects"].get(key)
+            if o is None:
+                o = {"dn": dn, "name": _attr_str(e, "sAMAccountName") or dn.split(",", 1)[0],
+                     "kind": kind, "labels": [], "admin": False}
+                d["objects"][key] = o
+            if label not in o["labels"]:
+                o["labels"].append(label)
 
         # Kerberoastable: enabled user accounts (not gMSA/krbtgt) with an SPN
         for e in _search(
@@ -706,6 +720,7 @@ def fetch_vuln(conn, domain_ncs, cache):
                 ["sAMAccountName", "servicePrincipalName"]):
             d["kerberoastable"].append((str(e["sAMAccountName"].value),
                                         [str(s) for s in e["servicePrincipalName"].values]))
+            _add(e, "kerberoastable", "user")
 
         # AS-REP roastable: enabled users with DONT_REQ_PREAUTH
         for e in _search(
@@ -713,12 +728,14 @@ def fetch_vuln(conn, domain_ncs, cache):
                 f"(userAccountControl:{bitand}:={UAC_DONT_REQ_PREAUTH})(!{disabled}))",
                 ["sAMAccountName"]):
             d["asrep"].append(str(e["sAMAccountName"].value))
+            _add(e, "AS-REP-roastable", "user")
 
         # Unconstrained delegation, excluding DCs / RODCs
         for e in _search(
                 f"(&(userAccountControl:{bitand}:={UAC_TRUSTED_FOR_DELEGATION}){not_dc})",
                 ["sAMAccountName", "objectClass"]):
             d["unconstrained"].append((str(e["sAMAccountName"].value), _acct_kind(e)))
+            _add(e, "unconstrained-deleg", _acct_kind(e))
 
         # Constrained delegation (classic + protocol transition), excluding DCs
         for e in _search(
@@ -729,10 +746,11 @@ def fetch_vuln(conn, domain_ncs, cache):
                 uac = int(e["userAccountControl"].value or 0)
             except Exception:
                 uac = 0
+            pt = bool(uac & UAC_TRUSTED_TO_AUTH_FOR_DELEGATION)
             d["constrained"].append((
-                str(e["sAMAccountName"].value), _acct_kind(e),
-                bool(uac & UAC_TRUSTED_TO_AUTH_FOR_DELEGATION),
+                str(e["sAMAccountName"].value), _acct_kind(e), pt,
                 [str(s) for s in e["msDS-AllowedToDelegateTo"].values]))
+            _add(e, "constrained-deleg" + ("+PT" if pt else ""), _acct_kind(e))
 
         # RBCD: accounts configured as a delegation target
         for e in _search(
@@ -745,6 +763,7 @@ def fetch_vuln(conn, domain_ncs, cache):
                 raw = None
             who = [resolve_sid(conn, s, nc, cache) for s in _rbcd_principals(raw)] if raw else []
             d["rbcd"].append((str(e["sAMAccountName"].value), _acct_kind(e), who))
+            _add(e, "RBCD", _acct_kind(e))
 
         # adminCount=1 principals (AdminSDHolder-protected / privileged) — a set,
         # used to star kerberoastable/AS-REP accounts that are also privileged.
@@ -761,6 +780,7 @@ def fetch_vuln(conn, domain_ncs, cache):
             hit = _secret_hit(e)
             if hit:
                 d["secrets"].append((str(e["sAMAccountName"].value), *hit))
+                _add(e, "secret-in-field", "user")
 
         # PASSWD_NOTREQD — enabled account that may allow an empty password
         # (skip disabled and the built-in Guest/DefaultAccount, which ship this way)
@@ -771,6 +791,7 @@ def fetch_vuln(conn, domain_ncs, cache):
             if _rid(_entry_sid(e)) in DEFAULT_ACCOUNT_NOISE_RIDS:
                 continue
             d["passwd_notreqd"].append(str(e["sAMAccountName"].value))
+            _add(e, "PASSWD_NOTREQD", "user")
 
         # Reversible encryption — password is recoverable in cleartext
         for e in _search(
@@ -780,6 +801,11 @@ def fetch_vuln(conn, domain_ncs, cache):
             if _rid(_entry_sid(e)) in DEFAULT_ACCOUNT_NOISE_RIDS:
                 continue
             d["reversible"].append(str(e["sAMAccountName"].value))
+            _add(e, "reversible-encryption", "user")
+
+        # Star objects that are also adminCount=1 (privileged)
+        for o in d["objects"].values():
+            o["admin"] = o["name"] in d["admincount"]
 
         out.append(d)
     return out
@@ -1301,6 +1327,14 @@ def build_tree(entries, with_gplink=False, with_acl=False):
     return ou_data
 
 
+def _print_vuln_objects(node, indent, out):
+    """Print the vulnerable objects attached to a tree node (see --vuln)."""
+    for o in sorted(node.get("vuln_objects", []), key=lambda x: x["name"].lower()):
+        star = f" {YELLOW}⭐adminCount{NC}" if o.get("admin") else ""
+        print(f"{indent}{RED}⚠{NC} {o['name']} {GREY}({o['kind']}){NC} "
+              f"{RED}[{', '.join(o['labels'])}]{NC}{star}", file=out)
+
+
 def print_ou(item, depth, extra_indent, out):
     indent = "  " * (depth + extra_indent)
     if item.get("is_container"):
@@ -1320,6 +1354,37 @@ def print_ou(item, depth, extra_indent, out):
         rights = ", ".join(ace["rights"])
         inh    = f" {GREY}(inherited){NC}{RED}" if ace["inherited"] else ""
         print(f"{indent}    {RED}! {rights} → {ace['who']}{inh}{NC}", file=out)
+    _print_vuln_objects(item, indent + "    ", out)
+
+
+def _host_node(obj_dn, index):
+    """Nearest ancestor node (OU/container/domain/root) present in `index`."""
+    dn = obj_dn
+    while "," in dn:
+        dn = dn.split(",", 1)[1]           # climb to parent, then keep climbing
+        node = index.get(dn.lower())
+        if node is not None:
+            return node
+    return None
+
+
+def attach_vuln_objects(ou_data, root_item, domains, vuln_info):
+    """Place each vulnerable object under its nearest ancestor tree node so
+    print_tree can show it inline. Objects in non-displayed containers (e.g.
+    CN=Users) fall through to the domain/root node."""
+    index = {item["dn"].lower(): item for item in ou_data}
+    if root_item and root_item.get("dn"):
+        index[root_item["dn"].lower()] = root_item
+    if domains:
+        for dom in domains.values():
+            index[dom["dn"].lower()] = dom
+    for node in index.values():
+        node.setdefault("vuln_objects", [])
+    for d in vuln_info:
+        for o in d.get("objects", {}).values():
+            host = _host_node(o["dn"], index)
+            if host is not None:
+                host["vuln_objects"].append(o)
 
 
 def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
@@ -1337,6 +1402,7 @@ def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
 
     if root_item:
         print(f"{root_item['name']}{format_counts(root_item)}{format_maq(root_item)}", file=out)
+        _print_vuln_objects(root_item, "    ", out)
 
     if domains:
         # GC mode: group OUs by domain, each domain is its own subtree
@@ -1349,6 +1415,7 @@ def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
             if i > 0:
                 print("\n" * 1, file=out)  # 1 newline + the implicit one = 2 blank lines
             print(f"  +-- {domain_item['name']} {GREY}[{domain_item['dn']}]{NC}{format_counts(domain_item)}{format_maq(domain_item)}", file=out)
+            _print_vuln_objects(domain_item, "      ", out)
             for item in sorted(by_domain.get(domain_dn, []), key=lambda x: [p.lower() for p in x["path"]]):
                 print_ou(item, len(item["path"]) - 1, extra_indent=2, out=out)
     else:
@@ -1842,6 +1909,7 @@ def main():
     if args.vuln:
         log_verbose("Enumerating kerberoast/AS-REP/delegation attack surface", args.verbose)
         vuln_info = fetch_vuln(conn, naming_contexts, {})
+        attach_vuln_objects(ou_data, root, domains, vuln_info)
 
     if args.groups:
         log_verbose("Enumerating privileged group membership", args.verbose)

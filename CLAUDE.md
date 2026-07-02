@@ -163,6 +163,17 @@ in the harness is the guard against interpolation typos. Note: searches are not 
 (consistent with the rest of the tool), so very large result sets hit the server's
 size limit — raise paging here if a domain has >1000 kerberoastable users.
 
+**`--vuln` also annotates the OU tree inline.** Besides the flat per-category section,
+`fetch_vuln()` builds `d["objects"]` (keyed by DN, one entry per object with all its
+labels aggregated and an `admin` flag from the adminCount set). `attach_vuln_objects()`
+indexes every tree node by DN (OU items + root + GC domain nodes) and hangs each object
+off its **nearest ancestor** node via `_host_node()` (climb the DN, first match wins) —
+so an object in a non-displayed container like `CN=Users` falls through to the domain/
+root node rather than vanishing. `print_ou`/`print_tree` render them with `⚠` under the
+node. It's driven off the same `objects` dict, so the tree and the flat section can't
+disagree. `_host_node` relies on the node index being keyed lowercase — keep DN
+comparisons case-insensitive.
+
 ### The other enumeration modules
 
 All follow the same shape: an independent `--flag`, a `fetch_x()` returning per-domain
