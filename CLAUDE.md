@@ -106,6 +106,27 @@ the test harness (build with impacket → `analyze_sd`) is the way to verify cha
 here without a live DC — GUID decoding via `bin_to_string` must stay lowercase to
 match `KNOWN_OBJECT_GUIDS` keys.
 
+**GPO objects get the same treatment, by design-reuse.** `fetch_gpo_acls()` returns
+GPO records shaped exactly like OU items (`name`/`dn`/`_sd_raw`) so the *same*
+`enrich_acls()` processes them unchanged; `print_gpo_acls()` renders them in a
+section after the tree (via the `emit()` helper in `main()`, so file and stdout stay
+in sync). The rationale is the attack path: write access to a GPO object = code
+execution on every OU it's linked to, and an over-permissioned GPO is invisible in
+the OU tree otherwise. RID 520 (Group Policy Creator Owners) is in the default set
+specifically for this — it holds full control over GPOs by default.
+
+**"Who can create GPOs" is a container-ACL question, not an object one.** Creating a
+GPO needs `CreateChild` on `CN=Policies,CN=System,<nc>`, held by default only by
+DA/EA/SYSTEM/GPCO. `fetch_gpo_creators()` reports two non-default sources per domain:
+(1) `creators_from_sd()` scans that container's DACL for CreateChild that is unscoped
+or object-scoped to `GROUP_POLICY_CONTAINER_CLASS_GUID` (`f30e3bc2-…`; a CreateChild
+scoped to any *other* class is correctly ignored — GenericWrite alone doesn't grant
+creation); (2) transitive members of GPCO, since GPCO is empty by default so any
+member is a delegation — resolved via `LDAP_MATCHING_RULE_IN_CHAIN`
+(`memberOf:1.2.840.113556.1.4.1941:=<gpco_dn>`), with `find_gpco_dn()` locating GPCO
+by `<domainSID>-520`. This chains with the OU findings: create-GPO + gPLink-write =
+full compromise of that OU subtree.
+
 **Recursive counts are computed client-side, not by the server.** `fetch_counts()`
 does one subtree search per object class and buckets each hit by its *immediate*
 parent DN. `recursive_count()` then sums a container plus everything whose DN ends

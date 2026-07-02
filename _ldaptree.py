@@ -16,7 +16,8 @@ except ImportError:
 # impacket is only needed for --acl (parsing the nTSecurityDescriptor blob).
 try:
     from impacket.ldap.ldaptypes import (
-        SR_SECURITY_DESCRIPTOR, ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_OBJECT_ACE)
+        SR_SECURITY_DESCRIPTOR, ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_OBJECT_ACE,
+        LDAP_SID)
     from impacket.uuid import bin_to_string
     HAS_IMPACKET = True
 except ImportError:
@@ -94,6 +95,42 @@ def fetch_gpo_names(conn, domain_ncs):
     return result
 
 
+def fetch_gpo_acls(conn, domain_ncs):
+    """Return a GPO record per groupPolicyContainer, each carrying its raw SD.
+
+    Records are shaped like the OU items (name/dn/_sd_raw) so enrich_acls() can
+    process them unchanged. Whoever can write a GPO object owns every OU it is
+    linked to, so its DACL is exactly as interesting as an OU's.
+    """
+    gpos = []
+    controls = security_descriptor_control(sdflags=0x05)  # DACL + Owner, no SACL
+    for nc in domain_ncs:
+        try:
+            conn.search(
+                search_base=f"CN=Policies,CN=System,{nc}",
+                search_filter="(objectClass=groupPolicyContainer)",
+                search_scope=SUBTREE,
+                attributes=["displayName", "nTSecurityDescriptor"],
+                controls=controls,
+            )
+        except LDAPException:
+            continue
+        for e in conn.entries:
+            dn = str(e.entry_dn)
+            try:
+                name = str(e["displayName"].value or dn)
+            except Exception:
+                name = dn
+            try:
+                sd = e["nTSecurityDescriptor"].raw_values[0]
+            except Exception:
+                sd = None
+            gpos.append({"name": name, "dn": dn,
+                         "guid": dn.split(",")[0][3:],  # CN={GUID} → {GUID}
+                         "_sd_raw": sd})
+    return gpos
+
+
 def parse_gplinks(gplink_str, gpo_names):
     """Parse a gPLink attribute string into an ordered list of GPO-link dicts.
 
@@ -155,6 +192,10 @@ KNOWN_OBJECT_GUIDS = {
     "f30e3bbe-9ff0-11d1-b603-0000f80367c1": "gPLink",
 }
 
+# schemaIDGUID of the groupPolicyContainer class — the child-object type in a
+# CreateChild ACE on CN=Policies,CN=System that means "can create GPOs".
+GROUP_POLICY_CONTAINER_CLASS_GUID = "f30e3bc2-9ff0-11d1-b603-0000f80367c1"
+
 # Built-in principals that hold these rights on OUs by *default* — either Tier-0
 # admins or the operator groups AD delegates object create/delete to out of the
 # box (this is why Account Operators shows CreateChild/DeleteChild on every OU).
@@ -178,6 +219,7 @@ DEFAULT_PRIVILEGED_RIDS = {
     516,  # Domain Controllers
     518,  # Schema Admins
     519,  # Enterprise Admins
+    520,  # Group Policy Creator Owners (default full control over GPOs it creates)
     521,  # Read-only Domain Controllers
     498,  # Enterprise Read-only Domain Controllers
 }
@@ -344,6 +386,121 @@ def enrich_acls(conn, ou_data, search_base):
                 "rights":    agg[sid]["rights"],
                 "inherited": agg[sid]["inherited"],
             })
+
+
+def creators_from_sd(sd_bytes):
+    """SIDs (non-default) that can create GPOs given the Policies-container SD.
+
+    "Can create" = CreateChild (unscoped, or object-scoped to the
+    groupPolicyContainer class) or full control / GenericAll. GenericWrite alone
+    does not grant child creation and is intentionally excluded.
+    """
+    sd = SR_SECURITY_DESCRIPTOR(data=sd_bytes)
+    out  = []
+    dacl = sd["Dacl"]
+    if not dacl:
+        return out
+    for ace in dacl["Data"]:
+        if ace["AceType"] not in (ACCESS_ALLOWED_ACE.ACE_TYPE,
+                                  ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE):
+            continue
+        body = ace["Ace"]
+        mask = body["Mask"]["Mask"]
+        can_create = bool(mask & ACE_DS_CREATE_CHILD) or bool(mask & ACE_GENERIC_ALL) \
+            or (mask & ACE_FULL_CONTROL) == ACE_FULL_CONTROL
+        if not can_create:
+            continue
+        # An object-scoped CreateChild only counts if it targets the GPO class.
+        if ace["AceType"] == ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE and \
+           (body["Flags"] & ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT):
+            if bin_to_string(body["ObjectType"]).lower() != GROUP_POLICY_CONTAINER_CLASS_GUID:
+                continue
+        sid = body["Sid"].formatCanonical()
+        if is_default_privileged(sid) or sid in out:
+            continue
+        out.append(sid)
+    return out
+
+
+def _entry_sid(entry):
+    """Best-effort SID string from an ldap3 entry's objectSid (str or bytes)."""
+    try:
+        val = entry["objectSid"].value
+    except Exception:
+        return None
+    if isinstance(val, bytes):
+        try:
+            return LDAP_SID(data=val).formatCanonical()
+        except Exception:
+            return None
+    return str(val) if val else None
+
+
+def find_gpco_dn(conn, nc):
+    """DN of this domain's Group Policy Creator Owners group (RID 520), or None."""
+    try:
+        conn.search(nc, "(objectClass=*)", search_scope=BASE, attributes=["objectSid"])
+        dom_sid = _entry_sid(conn.entries[0]) if conn.entries else None
+    except LDAPException:
+        dom_sid = None
+    if not dom_sid:
+        return None
+    try:
+        conn.search(nc, f"(objectSid={dom_sid}-520)", search_scope=SUBTREE, attributes=[])
+        if conn.entries:
+            return str(conn.entries[0].entry_dn)
+    except LDAPException:
+        pass
+    return None
+
+
+def fetch_gpo_creators(conn, domain_ncs, cache):
+    """Per-domain list of non-default principals who can create GPOs.
+
+    Two sources, both excluding built-in/default holders (DA/EA/SYSTEM/GPCO):
+      - members: transitive members of Group Policy Creator Owners (empty by
+        default, so any member is a delegation), via LDAP_MATCHING_RULE_IN_CHAIN.
+      - delegations: custom CreateChild ACEs on CN=Policies,CN=System,<nc>.
+    """
+    sd_ctrl = security_descriptor_control(sdflags=0x04)  # DACL only
+    out = []
+    for nc in domain_ncs:
+        info = {"domain": domain_from_base_dn(nc), "members": [], "delegations": []}
+
+        gpco_dn = find_gpco_dn(conn, nc)
+        if gpco_dn:
+            try:
+                conn.search(nc,
+                            f"(memberOf:1.2.840.113556.1.4.1941:={gpco_dn})",
+                            search_scope=SUBTREE,
+                            attributes=["sAMAccountName", "objectSid", "objectClass"])
+                for e in conn.entries:
+                    sid = _entry_sid(e)
+                    if sid and is_default_privileged(sid):
+                        continue
+                    classes  = [str(c).lower() for c in e["objectClass"].values]
+                    is_group = "group" in classes
+                    try:
+                        name = str(e["sAMAccountName"].value or e.entry_dn)
+                    except Exception:
+                        name = str(e.entry_dn)
+                    info["members"].append((name, is_group))
+            except LDAPException:
+                pass
+
+        policies_dn = f"CN=Policies,CN=System,{nc}"
+        try:
+            conn.search(policies_dn, "(objectClass=*)", search_scope=BASE,
+                        attributes=["nTSecurityDescriptor"], controls=sd_ctrl)
+            if conn.entries:
+                raw = conn.entries[0]["nTSecurityDescriptor"].raw_values[0]
+                for sid in creators_from_sd(raw):
+                    info["delegations"].append(resolve_sid(conn, sid, nc, cache))
+        except (LDAPException, IndexError):
+            pass
+
+        out.append(info)
+    return out
 
 
 def query_rootdse(server):
@@ -514,6 +671,51 @@ def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
             print_ou(item, len(item["path"]) - 1, extra_indent=1 if root_item else 0, out=out)
 
 
+def print_gpo_acls(gpo_items, out=None):
+    """Print the GPO objects that carry non-default/abusable rights."""
+    out = out or sys.stdout
+    flagged = sorted((g for g in gpo_items if g.get("acl")),
+                     key=lambda x: x["name"].lower())
+    print("", file=out)
+    print("Group Policy Objects — non-default rights", file=out)
+    print(f"GPOs: {len(gpo_items)}  Flagged: {len(flagged)}", file=out)
+    print("=" * 60, file=out)
+    if not flagged:
+        print("No non-default rights found on GPO objects.", file=out)
+        return
+    for g in flagged:
+        print(f"{g['name']} {GREY}[{g['guid']}]{NC}", file=out)
+        for ace in g["acl"]:
+            rights = ", ".join(ace["rights"])
+            inh    = f" {GREY}(inherited){NC}{RED}" if ace["inherited"] else ""
+            print(f"    {RED}! {rights} → {ace['who']}{inh}{NC}", file=out)
+
+
+def print_gpo_creators(creator_info, out=None):
+    """Print who (non-default) can create GPOs, per domain."""
+    out = out or sys.stdout
+    print("", file=out)
+    print("GPO creation rights — non-default", file=out)
+    print("=" * 60, file=out)
+    if not any(c["members"] or c["delegations"] for c in creator_info):
+        print("No non-default GPO-creation rights found "
+              "(only built-in admins can create GPOs).", file=out)
+        return
+    for c in creator_info:
+        if not (c["members"] or c["delegations"]):
+            continue
+        print(c["domain"], file=out)
+        if c["members"]:
+            print(f"  {GREY}Group Policy Creator Owners members:{NC}", file=out)
+            for name, is_group in c["members"]:
+                tag = f" {GREY}(group){NC}" if is_group else ""
+                print(f"    {RED}• {name}{tag}{NC}", file=out)
+        if c["delegations"]:
+            print(f"  {GREY}Delegated CreateChild on CN=Policies,CN=System:{NC}", file=out)
+            for name in c["delegations"]:
+                print(f"    {RED}! CreateChild → {name}{NC}", file=out)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="ldaptree",
@@ -529,7 +731,7 @@ def main():
     parser.add_argument("-v", "--verbose",  action="store_true",             help="Verbose logging")
     parser.add_argument("--gc",             action="store_true",             help="Query the Global Catalog (port 3269/3268) for forest-wide enumeration")
     parser.add_argument("--containers",     action="store_true",             help="Include well-known containers (CN=Users, CN=Computers, etc.) in the tree")
-    parser.add_argument("--acl",            action="store_true",             help="Flag non-default/abusable ACEs on each OU (owner, WriteDacl/WriteOwner, GenericAll/Write, Create/DeleteChild, WriteProperty on gPLink, ...). Requires impacket")
+    parser.add_argument("--acl",            action="store_true",             help="Flag non-default/abusable ACEs on each OU and each GPO object (owner, WriteDacl/WriteOwner, GenericAll/Write, Create/DeleteChild, WriteProperty on gPLink, ...). Requires impacket")
     parser.add_argument("--no-ldaps",       action="store_true",             help="Use plain LDAP (port 389/3268) instead of LDAPS")
     parser.add_argument("--version",        action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
@@ -662,14 +864,32 @@ def main():
     for item in ou_data:
         item["gplinks"] = parse_gplinks(item.pop("_gplink_raw", ""), gpo_names)
 
+    gpo_items = []
+    gpo_creators = []
     if args.acl:
-        log_verbose("Analyzing OU security descriptors for non-default ACEs", args.verbose)
         # Resolve trustee SIDs against the DC's own domain NC (rootDSE default).
         acl_base = rootdse.get("defaultNamingContext") or args.base_dn or (
             naming_contexts[0] if naming_contexts else "")
+
+        log_verbose("Analyzing OU security descriptors for non-default ACEs", args.verbose)
         enrich_acls(conn, ou_data, acl_base)
-        n_flagged = sum(1 for i in ou_data if i.get("acl"))
-        log_verbose(f"Flagged interesting ACEs on {n_flagged} OUs", args.verbose)
+        log_verbose(f"Flagged interesting ACEs on "
+                    f"{sum(1 for i in ou_data if i.get('acl'))} OUs", args.verbose)
+
+        if args.gc:
+            log_verbose("GC mode: GPO security descriptors may be incomplete over the GC port", args.verbose)
+        log_verbose("Analyzing GPO security descriptors for non-default ACEs", args.verbose)
+        gpo_items = fetch_gpo_acls(conn, naming_contexts)
+        enrich_acls(conn, gpo_items, acl_base)
+        log_verbose(f"Flagged non-default rights on "
+                    f"{sum(1 for g in gpo_items if g.get('acl'))} of {len(gpo_items)} GPOs",
+                    args.verbose)
+
+        log_verbose("Enumerating non-default GPO-creation rights", args.verbose)
+        gpo_creators = fetch_gpo_creators(conn, naming_contexts, {})
+        log_verbose(f"Found non-default GPO creators in "
+                    f"{sum(1 for c in gpo_creators if c['members'] or c['delegations'])} domain(s)",
+                    args.verbose)
 
     for count_key, ldap_filter in [
         ("computer_count", "(objectClass=computer)"),
@@ -720,16 +940,22 @@ def main():
 
     conn.unbind()
 
+    def emit(out):
+        print_tree(ou_data, args.base_dn, root_item=root, domains=domains, out=out)
+        if args.acl:
+            print_gpo_acls(gpo_items, out=out)
+            print_gpo_creators(gpo_creators, out=out)
+
     if args.output:
         try:
             with open(args.output, "w") as f:
-                print_tree(ou_data, args.base_dn, root_item=root, domains=domains, out=f)
+                emit(f)
             log_success(f"Results saved to: {args.output}")
         except OSError as e:
             log_error(f"Could not write {args.output}: {e}")
             sys.exit(1)
     else:
-        print_tree(ou_data, args.base_dn, root_item=root, domains=domains)
+        emit(sys.stdout)
 
     log_success("Done")
 

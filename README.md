@@ -50,7 +50,7 @@ Only three arguments are required. Everything else is resolved automatically:
 | `-v`, `--verbose` | Verbose logging |
 | `--gc` | Query the Global Catalog (port 3269/3268) for forest-wide enumeration |
 | `--containers` | Include well-known containers (`CN=Users`, `CN=Computers`, …) in the tree |
-| `--acl` | Flag non-default / abusable ACEs on each OU (requires impacket) |
+| `--acl` | Flag non-default / abusable ACEs on each OU **and each GPO object** (requires impacket) |
 | `--no-ldaps` | Use plain LDAP (port 389/3268) instead of LDAPS |
 | `--version` | Show version |
 
@@ -126,6 +126,34 @@ Rights surfaced: `Owner` (non-default), `GenericAll`, `GenericWrite`, `WriteDacl
 To keep the output to genuine delegations, ACEs held by built-in principals that hold rights on every OU **by default** are not shown — both Tier-0 admins (SYSTEM, Administrators, Domain/Enterprise Admins, Domain Controllers, Enterprise Domain Controllers, Creator Owner, Schema Admins, RODCs, `SELF`) and the operator groups AD delegates object create/delete to out of the box (**Account Operators**, Server/Print/Backup Operators — their risk is group membership, not a per-OU delegation). A delegated write scoped to a single benign attribute is also skipped; only object-wide rights and writes to attack-relevant attributes (`gPLink`) are flagged.
 
 Rights are aggregated per trustee: a principal that appears in several ACEs (AD often splits `CreateChild` into one object-scoped ACE per child class) is shown once with the union of its rights, marked `(inherited)` only if *every* one of its ACEs is inherited.
+
+The same analysis is run against every **GPO object** and reported in a section after the tree:
+
+```
+Group Policy Objects — non-default rights
+GPOs: 7  Flagged: 1
+============================================================
+Helpdesk Deploy [{AAAA1111-2222-3333-4444-555566667777}]
+    ! GenericWrite → helpdesk
+    ! WriteDacl → manuel
+```
+
+This matters because **whoever can write a GPO object owns every OU it is linked to** — modifying the GPO runs code on all affected computers and users (the SharpGPOAbuse / pyGPOAbuse path). Unlike an over-permissioned OU, an over-permissioned GPO is otherwise invisible in the tree, and the section also surfaces GPOs that aren't linked anywhere. The same default-principal filter applies, plus **Group Policy Creator Owners** (which holds full control over GPOs it creates by default).
+
+Finally, `--acl` reports **who can create new GPOs** (non-default), in a closing section:
+
+```
+GPO creation rights — non-default
+============================================================
+inlanefreight.local
+  Group Policy Creator Owners members:
+    • manuel
+    • gpo-admins (group)
+  Delegated CreateChild on CN=Policies,CN=System:
+    ! CreateChild → custom-svc
+```
+
+Creating a GPO requires `CreateChild` on `CN=Policies,CN=System,<domain>`, held by default only by Domain/Enterprise Admins, SYSTEM, and **Group Policy Creator Owners** (GPCO). GPCO is empty by default, so the tool reports two non-default sources: the **transitive members of GPCO** (expanded via `LDAP_MATCHING_RULE_IN_CHAIN`) and any **custom `CreateChild` delegation** on the container (unscoped, or scoped to the `groupPolicyContainer` class). A principal who can create a GPO can then link it wherever they also hold `WriteProperty(gPLink)` — the two findings chain together.
 
 > Reading the DACL is a normal authenticated read — no elevated privilege is needed. The SACL is never requested, so `SeSecurityPrivilege` is not required. Requires the `acl` extra (`impacket`).
 
