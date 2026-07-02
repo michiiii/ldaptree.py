@@ -196,6 +196,11 @@ KNOWN_OBJECT_GUIDS = {
 # CreateChild ACE on CN=Policies,CN=System that means "can create GPOs".
 GROUP_POLICY_CONTAINER_CLASS_GUID = "f30e3bc2-9ff0-11d1-b603-0000f80367c1"
 
+# Control-access-right GUIDs whose combination on the domain head grants DCSync
+# (replicate + replicate secrets → dump every password hash, incl. krbtgt).
+DS_REPL_GET_CHANGES     = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+DS_REPL_GET_CHANGES_ALL = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+
 # Built-in principals that hold these rights on OUs by *default* — either Tier-0
 # admins or the operator groups AD delegates object create/delete to out of the
 # box (this is why Account Operators shows CreateChild/DeleteChild on every OU).
@@ -503,6 +508,72 @@ def fetch_gpo_creators(conn, domain_ncs, cache):
     return out
 
 
+def dcsync_from_sd(sd_bytes):
+    """Return {sid: {repl rights}} for non-default principals on the domain head.
+
+    Rights are 'GetChanges' / 'GetChangesAll'; holding both (or GenericAll / all
+    extended rights) == DCSync. Rights from separate ACEs are unioned per SID.
+    """
+    sd = SR_SECURITY_DESCRIPTOR(data=sd_bytes)
+    acc  = {}
+    dacl = sd["Dacl"]
+    if not dacl:
+        return acc
+    for ace in dacl["Data"]:
+        if ace["AceType"] not in (ACCESS_ALLOWED_ACE.ACE_TYPE,
+                                  ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE):
+            continue
+        body = ace["Ace"]
+        mask = body["Mask"]["Mask"]
+        sid  = body["Sid"].formatCanonical()
+        if is_default_privileged(sid):
+            continue
+
+        grants = set()
+        if bool(mask & ACE_GENERIC_ALL) or (mask & ACE_FULL_CONTROL) == ACE_FULL_CONTROL:
+            grants.update(("GetChanges", "GetChangesAll"))
+        if mask & ACE_DS_CONTROL_ACCESS:
+            obj_guid = None
+            if ace["AceType"] == ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE and \
+               (body["Flags"] & ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT):
+                obj_guid = bin_to_string(body["ObjectType"]).lower()
+            if obj_guid is None:                       # all extended rights
+                grants.update(("GetChanges", "GetChangesAll"))
+            elif obj_guid == DS_REPL_GET_CHANGES:
+                grants.add("GetChanges")
+            elif obj_guid == DS_REPL_GET_CHANGES_ALL:
+                grants.add("GetChangesAll")
+
+        if grants:
+            acc.setdefault(sid, set()).update(grants)
+    return acc
+
+
+def fetch_dcsync_rights(conn, domain_ncs, cache):
+    """Per-domain list of non-default principals holding replication rights on
+    the domain head; those with both Get-Changes and Get-Changes-All can DCSync.
+    """
+    sd_ctrl = security_descriptor_control(sdflags=0x04)  # DACL only
+    out = []
+    for nc in domain_ncs:
+        info = {"domain": domain_from_base_dn(nc), "principals": []}
+        try:
+            conn.search(nc, "(objectClass=*)", search_scope=BASE,
+                        attributes=["nTSecurityDescriptor"], controls=sd_ctrl)
+            if conn.entries:
+                raw = conn.entries[0]["nTSecurityDescriptor"].raw_values[0]
+                for sid, rights in dcsync_from_sd(raw).items():
+                    info["principals"].append({
+                        "who":    resolve_sid(conn, sid, nc, cache),
+                        "rights": rights,
+                        "dcsync": {"GetChanges", "GetChangesAll"}.issubset(rights),
+                    })
+        except (LDAPException, IndexError):
+            pass
+        out.append(info)
+    return out
+
+
 def query_rootdse(server):
     """Return rootDSE attributes from an anonymous query, or {}."""
     try:
@@ -716,6 +787,28 @@ def print_gpo_creators(creator_info, out=None):
                 print(f"    {RED}! CreateChild → {name}{NC}", file=out)
 
 
+def print_dcsync(dcsync_info, out=None):
+    """Print who (non-default) can DCSync, per domain."""
+    out = out or sys.stdout
+    print("", file=out)
+    print("DCSync rights — non-default", file=out)
+    print("=" * 60, file=out)
+    if not any(d["principals"] for d in dcsync_info):
+        print("No non-default replication rights found on the domain head.", file=out)
+        return
+    for d in dcsync_info:
+        if not d["principals"]:
+            continue
+        print(d["domain"], file=out)
+        # full DCSync first, then partial holders
+        for p in sorted(d["principals"], key=lambda x: (not x["dcsync"], x["who"].lower())):
+            if p["dcsync"]:
+                print(f"    {RED}!! DCSync (GetChanges + GetChangesAll) → {p['who']}{NC}", file=out)
+            else:
+                have = " + ".join(sorted(p["rights"]))
+                print(f"    {YELLOW}!  {have} (partial — not enough alone) → {p['who']}{NC}", file=out)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="ldaptree",
@@ -731,7 +824,7 @@ def main():
     parser.add_argument("-v", "--verbose",  action="store_true",             help="Verbose logging")
     parser.add_argument("--gc",             action="store_true",             help="Query the Global Catalog (port 3269/3268) for forest-wide enumeration")
     parser.add_argument("--containers",     action="store_true",             help="Include well-known containers (CN=Users, CN=Computers, etc.) in the tree")
-    parser.add_argument("--acl",            action="store_true",             help="Flag non-default/abusable ACEs on each OU and each GPO object (owner, WriteDacl/WriteOwner, GenericAll/Write, Create/DeleteChild, WriteProperty on gPLink, ...). Requires impacket")
+    parser.add_argument("--acl",            action="store_true",             help="Flag non-default/abusable rights: ACEs on each OU and GPO object, who can create GPOs, and who can DCSync the domain. Requires impacket")
     parser.add_argument("--no-ldaps",       action="store_true",             help="Use plain LDAP (port 389/3268) instead of LDAPS")
     parser.add_argument("--version",        action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
@@ -866,6 +959,7 @@ def main():
 
     gpo_items = []
     gpo_creators = []
+    dcsync_info = []
     if args.acl:
         # Resolve trustee SIDs against the DC's own domain NC (rootDSE default).
         acl_base = rootdse.get("defaultNamingContext") or args.base_dn or (
@@ -890,6 +984,11 @@ def main():
         log_verbose(f"Found non-default GPO creators in "
                     f"{sum(1 for c in gpo_creators if c['members'] or c['delegations'])} domain(s)",
                     args.verbose)
+
+        log_verbose("Checking the domain head for non-default DCSync rights", args.verbose)
+        dcsync_info = fetch_dcsync_rights(conn, naming_contexts, {})
+        log_verbose(f"Found non-default replication rights in "
+                    f"{sum(1 for d in dcsync_info if d['principals'])} domain(s)", args.verbose)
 
     for count_key, ldap_filter in [
         ("computer_count", "(objectClass=computer)"),
@@ -945,6 +1044,7 @@ def main():
         if args.acl:
             print_gpo_acls(gpo_items, out=out)
             print_gpo_creators(gpo_creators, out=out)
+            print_dcsync(dcsync_info, out=out)
 
     if args.output:
         try:

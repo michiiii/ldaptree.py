@@ -147,6 +147,18 @@ inlanefreight.local
 
 Creating a GPO requires `CreateChild` on `CN=Policies,CN=System,<domain>`, held by default only by Domain/Enterprise Admins, SYSTEM, and **Group Policy Creator Owners** (GPCO). GPCO is empty by default, so the tool reports two non-default sources: the **transitive members of GPCO** (expanded via `LDAP_MATCHING_RULE_IN_CHAIN`) and any **custom `CreateChild` delegation** on the container (unscoped, or scoped to the `groupPolicyContainer` class). A principal who can create a GPO can then link it wherever they also hold `WriteProperty(gPLink)` — the two findings chain together.
 
+And it checks the **domain head** for non-default **DCSync** rights:
+
+```
+DCSync rights — non-default
+============================================================
+inlanefreight.local
+    !! DCSync (GetChanges + GetChangesAll) → svc-repl
+    !  GetChangesAll (partial — not enough alone) → bob
+```
+
+DCSync (replicating secrets to dump every password hash, including `krbtgt`) needs **both** the `DS-Replication-Get-Changes` and `DS-Replication-Get-Changes-All` control-access rights on the domain object — or `GenericAll` / all-extended-rights, which grant both. The two rights are unioned per principal even when granted by separate ACEs; anyone holding both (that isn't a default replication principal — DCs, Administrators, SYSTEM, Enterprise DCs, RODCs, DA/EA) is flagged `!!`. Holders of only one right are listed as `partial` for awareness.
+
 > Reading the DACL is a normal authenticated read — no elevated privilege is needed. The SACL is never requested, so `SeSecurityPrivilege` is not required.
 
 ## Save to file

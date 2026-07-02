@@ -128,6 +128,21 @@ member is a delegation — resolved via `LDAP_MATCHING_RULE_IN_CHAIN`
 by `<domainSID>-520`. This chains with the OU findings: create-GPO + gPLink-write =
 full compromise of that OU subtree.
 
+**DCSync is a domain-head-ACL question.** `fetch_dcsync_rights()` reads the domain
+NC head's DACL and `dcsync_from_sd()` accumulates, per non-default SID, which of the
+two replication control-access rights it holds — `DS_REPL_GET_CHANGES` (`1131f6aa-…`)
+and `DS_REPL_GET_CHANGES_ALL` (`1131f6ad-…`). Rights from *separate* ACEs are unioned
+per SID (they usually are separate); `GenericAll` and unscoped ControlAccess (all
+extended rights) both grant the pair. Holding both == DCSync == full domain
+compromise (dump `krbtgt`/all hashes). Every default replication holder (DCs 516, EDCs
+S-1-5-9, RODCs 498/521, Administrators, SYSTEM, DA/EA via GenericAll) is already in
+the default-principal set, so survivors are real delegations. These GUIDs are the
+canonical DCSync ones — don't "tidy" them.
+
+All four `--acl` sections (OU ACEs, GPO ACEs, GPO-creation, DCSync) print via the
+`emit()` helper so `-o` file output and stdout stay identical; each has an
+`x = []` init before the `if args.acl:` block so `emit()` never NameErrors.
+
 **Recursive counts are computed client-side, not by the server.** `fetch_counts()`
 does one subtree search per object class and buckets each hit by its *immediate*
 parent DN. `recursive_count()` then sums a container plus everything whose DN ends
