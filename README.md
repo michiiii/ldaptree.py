@@ -35,7 +35,8 @@ Only three arguments are required. Everything else is resolved automatically:
 |------|-------------|
 | `-s`, `--server` | LDAP server hostname or IP |
 | `-u`, `--user` | Bind username (sAMAccountName, UPN, or `DOMAIN\user`) |
-| `-p`, `--password` | Bind password |
+| `-p`, `--password` | Bind password (or use `-H`) |
+| `-H`, `--hash` | NT hash for pass-the-hash (`32 hex`, or `LM:NT`) — forces NTLM |
 | `-b`, `--base-dn` | Base DN — auto-discovered from rootDSE if omitted |
 | `-d`, `--domain` | NetBIOS domain name — forces NTLM auth instead of simple bind |
 | `-o`, `--output` | Save output to file |
@@ -70,6 +71,14 @@ The sAMAccountName is expanded to `user@dns.domain` and a simple bind is perform
 ```bash
 ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -p $AD_USER_PASS -d DOMAIN
 ```
+
+**Pass-the-hash** — authenticate with the NT hash instead of a password (`-H` in place of `-p`):
+
+```bash
+ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -H $AD_USER_HASH
+```
+
+`-H` takes a bare NT hash (`32 hex`) or a full `LM:NT` pair, and forces NTLM (pass-the-hash can't use simple bind, which sends a cleartext password). The `DOMAIN\user` principal is taken from `-u` if you supply it, otherwise from `-d`, otherwise the discovered DNS domain — pass `-d NETBIOS` if the DNS domain is rejected.
 
 **Global Catalog** — enumerate the entire forest (all domains) via GC port 3269/3268:
 

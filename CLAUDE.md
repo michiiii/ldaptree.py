@@ -45,10 +45,19 @@ each own one enrichment concern:
 1. **Connect & discover** — `query_rootDSE()` does an anonymous BASE query to learn
    `defaultNamingContext` / `namingContexts`. The base DN is auto-derived from this
    when `-b` is omitted.
-2. **Resolve auth** (three-way branch in `main`): `-d DOMAIN` → NTLM; a bare
-   sAMAccountName with a discoverable domain → auto-expanded to a UPN + simple bind;
-   otherwise the username is used verbatim with simple bind. If a bare-name simple
-   bind fails, the tool hints to retry with `-d` (some DCs disable simple bind).
+2. **Resolve auth** (branch in `main`): `-H/--hash` → NTLM pass-the-hash (see below);
+   `-d DOMAIN` → NTLM; a bare sAMAccountName with a discoverable domain → auto-expanded
+   to a UPN + simple bind; otherwise the username is used verbatim with simple bind. If
+   a bare-name simple bind fails, the tool hints to retry with `-d` (some DCs disable
+   simple bind). `bind_secret = args.hash or args.password` is what's passed to every
+   `Connection` (including the GC-mode secondary MAQ connection).
+
+   **Pass-the-hash** relies on ldap3's own `ntowf_v2` (utils/ntlm.py): if the password
+   is `LM:NT` with both halves exactly 32 hex, it unhexlifies the NT half and skips MD4.
+   `normalize_nt_hash()` produces that form (bare NT → empty-LM `aad3…` prepended). PtH
+   forces NTLM (simple bind would send the hash as a cleartext password) and needs a
+   `DOMAIN\user` principal, derived from `-u` / `-d` / the discovered DNS domain. Verify
+   changes against `NtlmClient.ntowf_v2` directly, as the test harness does — no DC needed.
 3. **Fetch OUs** — one SUBTREE search for `organizationalUnit` (plus `container` when
    `--containers` is set), pulling `gPLink`. `build_tree()` turns each entry's DN into
    a root→leaf `path`, and drops anything under a known system container

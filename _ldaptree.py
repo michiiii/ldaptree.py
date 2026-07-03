@@ -1246,6 +1246,25 @@ def domain_from_base_dn(base_dn):
     return ".".join(p[3:] for p in parts if p.upper().startswith("DC="))
 
 
+_EMPTY_LM_HASH = "aad3b435b51404eeaad3b435b51404ee"
+
+
+def normalize_nt_hash(h):
+    """Return an 'LM:NT' hex string ldap3 accepts for pass-the-hash, or None.
+
+    Accepts a bare NT hash (32 hex) or a full 'LM:NT'. A missing/blank LM half is
+    replaced with the empty-LM constant, since ldap3 only treats the password as a
+    hash when both halves are exactly 32 hex characters.
+    """
+    h = (h or "").strip()
+    lm, nt = h.split(":", 1) if ":" in h else ("", h)
+    lm, nt = (lm.strip() or _EMPTY_LM_HASH), nt.strip()
+    hexset = set("0123456789abcdefABCDEF")
+    if len(nt) != 32 or set(nt) - hexset or len(lm) != 32 or set(lm) - hexset:
+        return None
+    return f"{lm.lower()}:{nt.lower()}"
+
+
 def domain_dn_from_dn(dn):
     """Extract the domain DN (DC= components only) from any object DN."""
     parts = [p.strip() for p in dn.split(",")]
@@ -1717,7 +1736,8 @@ def main():
     parser.add_argument("-s", "--server",   required=True, metavar="HOST",   help="LDAP server hostname or IP")
     parser.add_argument("-b", "--base-dn",  metavar="DN",                    help="Base DN — auto-discovered from rootDSE if omitted")
     parser.add_argument("-u", "--user",     required=True, metavar="USER",   help="Bind username (sAMAccountName, UPN, or DOMAIN\\user)")
-    parser.add_argument("-p", "--password", required=True, metavar="PASS",   help="Bind password")
+    parser.add_argument("-p", "--password", metavar="PASS",                  help="Bind password (or use -H for pass-the-hash)")
+    parser.add_argument("-H", "--hash",     metavar="NTHASH",                help="NT hash for pass-the-hash (32 hex, or LM:NT) — forces NTLM auth")
     parser.add_argument("-d", "--domain",   metavar="DOMAIN",                help="NetBIOS domain name — forces NTLM auth")
     parser.add_argument("-o", "--output",   metavar="FILE",                  help="Save output to file")
     parser.add_argument("-v", "--verbose",  action="store_true",             help="Verbose logging")
@@ -1734,6 +1754,15 @@ def main():
     parser.add_argument("--no-ldaps",       action="store_true",             help="Use plain LDAP (port 389/3268) instead of LDAPS")
     parser.add_argument("--version",        action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
+
+    # Exactly one secret: password or NT hash.
+    if bool(args.password) == bool(args.hash):
+        parser.error("provide exactly one of -p/--password or -H/--hash")
+    if args.hash:
+        nt = normalize_nt_hash(args.hash)
+        if not nt:
+            parser.error("--hash must be an NT hash (32 hex chars) or LM:NT")
+        args.hash = nt  # normalised to 'LM:NT' for ldap3 pass-the-hash
 
     if args.all:
         args.acl = args.vuln = args.groups = args.creds = True
@@ -1787,7 +1816,22 @@ def main():
         args.base_dn or rootdse.get("rootDomainNamingContext", "")
     )
 
-    if args.domain:
+    bind_secret = args.hash or args.password
+    if args.hash:
+        # Pass-the-hash requires NTLM (simple bind sends a cleartext password) and
+        # a DOMAIN\user principal — take it from -u if given, else -d, else the
+        # discovered DNS domain.
+        bind_method = NTLM
+        if "\\" in args.user:
+            bind_user = args.user
+        elif "@" in args.user:
+            u, dom = args.user.split("@", 1)
+            bind_user = f"{dom}\\{u}"
+        else:
+            dom = args.domain or upn_domain or ""
+            bind_user = f"{dom}\\{args.user}" if dom else args.user
+        log_verbose(f"Using NTLM pass-the-hash as {bind_user}", args.verbose)
+    elif args.domain:
         bind_user   = f"{args.domain}\\{args.user}"
         bind_method = NTLM
         log_verbose(f"Using NTLM auth as {bind_user}", args.verbose)
@@ -1801,13 +1845,15 @@ def main():
         log_verbose(f"Using simple bind as {bind_user}", args.verbose)
 
     try:
-        conn = Connection(server, user=bind_user, password=args.password,
+        conn = Connection(server, user=bind_user, password=bind_secret,
                           authentication=bind_method, auto_bind=True,
                           receive_timeout=30)
     except LDAPException as e:
         log_error(f"Connection/auth failed: {e}")
-        if bare_sam and not args.domain:
+        if bare_sam and not args.domain and not args.hash:
             log_info("Tip: if simple bind is disabled on this DC, pass -d DOMAIN to use NTLM")
+        elif args.hash:
+            log_info("Tip: pass-the-hash needs the right domain — try -d NETBIOS if the DNS domain was rejected")
         sys.exit(1)
 
     log_success("LDAP connection established")
@@ -1959,7 +2005,7 @@ def main():
         ldap_conn = None
         try:
             _ldap_srv = Server(args.server, use_ssl=use_ssl, get_info=NONE)
-            ldap_conn = Connection(_ldap_srv, user=bind_user, password=args.password,
+            ldap_conn = Connection(_ldap_srv, user=bind_user, password=bind_secret,
                                    authentication=bind_method, auto_bind=True,
                                    receive_timeout=10)
             log_verbose(f"Opened regular LDAP connection for MAQ query ({local_nc})", args.verbose)
