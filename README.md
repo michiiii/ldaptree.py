@@ -15,7 +15,7 @@ git clone https://github.com/michiiii/ldaptree.py
 pipx install ./ldaptree.py
 ```
 
-`pycryptodome` (NTLM auth on Python 3.14+ / modern OpenSSL that no longer exposes MD4) and `impacket` (parsing the `nTSecurityDescriptor` blob for `--acl`) are installed automatically as dependencies.
+`pycryptodome` (NTLM auth on Python 3.14+ / modern OpenSSL that no longer exposes MD4) and `impacket` (parsing the `nTSecurityDescriptor` blob for `--acl` / `--adcs` / `--takeover`) are installed automatically as dependencies.
 
 ## Usage
 
@@ -50,6 +50,7 @@ Only three arguments are required. Everything else is resolved automatically:
 | `--trusts` | Domain / forest trusts (direction, type, transitivity, SID filtering) |
 | `--computers` | Computer inventory with OS, flagging end-of-life OSes and stale accounts |
 | `--adcs` | AD CS CAs and certificate templates, flagging ESC1/2/3/4/9 (requires impacket) |
+| `--takeover` | Scan **every object's** ACL and highlight (in **purple**) the objects the *current user* can take over — takeover-grade rights held by you, your groups, or Everyone/Authenticated Users (requires impacket) |
 | `-A`, `--all` | Enable every enumeration module above |
 | `--no-ldaps` | Use plain LDAP (port 389/3268) instead of LDAPS |
 | `--version` | Show version |
@@ -232,6 +233,33 @@ With `--vuln`, the vulnerable objects are **also placed inline in the OU tree**,
 
 Each object is shown once with all of its labels aggregated; objects in containers that aren't displayed (e.g. `CN=Users`) attach to the nearest ancestor shown — usually the domain root. The flat section above remains the detailed view (SPNs, delegation targets, RBCD principals, secret values).
 
+## What can I take over? (`--takeover`)
+
+Every other module reports *non-default* configurations. `--takeover` answers a different, immediately actionable question: **which objects can the account I'm bound as take over, right now?** It resolves your effective token — your own SID plus every group in it (via the DC-computed `tokenGroups`), plus Everyone / Authenticated Users — then pages through **every object in every partition the DC exposes** (the domain NC, **Configuration**, Schema, and the DNS app partitions), parses each `nTSecurityDescriptor`, and keeps only the objects where *your* token is granted a takeover-grade right (`GenericAll`, `WriteDacl`, `WriteOwner`, `GenericWrite`, `CreateChild`, a `gPLink`/all-attribute write, all-extended-rights, or ownership).
+
+Scanning the **Configuration** partition matters: Sites and the entire AD CS configuration live there, not under the domain head. Linking a GPO to a site — e.g. `New-GPLink -Target "Default-First-Site-Name"`, which applies it to every computer in that site (the DCs, typically) — is a `gPLink` write on a Configuration object, so a domain-NC-only scan (or the OU tree) would never show that you can do it. Findings outside the domain NC are tagged with their partition, e.g. `contoso.local (Configuration)`.
+
+```bash
+ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -p $AD_USER_PASS --takeover
+```
+
+Because it's about *you*, not defaults, matches are shown **prominently in purple** — both as a closing section and inline in the OU tree:
+
+```
+Objects YOU can take over — takeover-grade rights held by j.doe
+Controllable objects: 3
+============================================================
+inlanefreight.local
+    ★ GenericAll → svc-sql (user) via Helpdesk-Admins
+      CN=svc-sql,OU=Servers,DC=inlanefreight,DC=local
+    ★ WriteDacl → WS01$ (computer) via Everyone
+      CN=WS01,OU=Servers,DC=inlanefreight,DC=local
+    ★ Owner → oldapp (group) via you (j.doe)
+      CN=oldapp,OU=Groups,DC=inlanefreight,DC=local
+```
+
+`via` tells you *how* the right reaches you — directly, through a group you're in, or through Everyone/Authenticated Users (a right granted to Authenticated Users is a path for every domain user). Owning an object is reported too, since an owner holds implicit `WriteDacl`. Unlike the other ACL views this **does not** filter "default" principals — being in Domain Admins would light up the whole domain, which is the correct answer. Unlike the rest of the tool, this scan is **paged**, so a large domain won't hit the server's result-size limit and get silently truncated — though `--gc` results can be partial because object SDs are incomplete over the Global Catalog port. Requires impacket.
+
 ## More enumeration modules
 
 | Flag | What you get |
@@ -258,7 +286,7 @@ Each `pKICertificateTemplate` is evaluated from LDAP alone: **ESC1** (enrollee s
 
 ESC4 and the ESC7 CA-object check are deliberately restricted to **low-privileged** trustees (Everyone / Authenticated Users / Domain Users / Domain Computers / Users). Admins and the CA's own host machine account hold these rights on the built-in templates *by default*, so flagging them would bury real findings in noise — a single-attribute `WriteProperty` is likewise not treated as ESC4. The trade-off: a delegation to a **custom** (non-low-priv) group won't show; run [Certipy](https://github.com/ly4k/Certipy) for exhaustive template-ACL analysis, and to confirm/exploit ESC6/ESC8/ESC11 (which depend on CA registry / HTTP / RPC state and aren't LDAP-observable).
 
-> The modules that parse security descriptors (`--acl`, `--adcs`) need impacket; the rest are pure LDAP reads.
+> The modules that parse security descriptors (`--acl`, `--adcs`, `--takeover`) need impacket; the rest are pure LDAP reads.
 
 ## Save to file
 

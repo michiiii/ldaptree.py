@@ -185,6 +185,49 @@ node. It's driven off the same `objects` dict, so the tree and the flat section 
 disagree. `_host_node` relies on the node index being keyed lowercase — keep DN
 comparisons case-insensitive.
 
+### Self takeover (`--takeover`) — the inverse of the ACL filter
+
+Every other ACL view filters *out* the caller and asks "which grants are non-default?".
+`--takeover` inverts both: it keeps **only** ACEs whose trustee is the caller, and does
+**not** filter default principals (being in Domain Admins *should* light up the whole
+domain — that's the true answer). It answers "what can the identity I'm bound as take
+over right now?", so its findings are rendered in **bold purple** (`BPURPLE`), the one
+color reserved for it — a section after the tree *and* inline (`⚑ YOU`) under the
+nearest node, reusing the `--vuln` placement machinery (`attach_takeover_objects` +
+`_host_node`). Gated on impacket, alongside `--acl`/`--adcs`.
+
+Three load-bearing pieces:
+- **The caller's token is the match set.** `resolve_self_sids()` finds the caller's own
+  object via the LDAP *whoami* extended op (`conn.extend.standard.who_am_i()` →
+  `u:DOM\user` / `u:user@dom` / `dn:…`), falling back to the sAMAccountName parsed from
+  the bind username, then reads `tokenGroups` — the DC-computed, fully-transitive set of
+  group SIDs (binary, decoded with `LDAP_SID`) — plus `objectSid`. **Everyone (S-1-1-0)
+  and Authenticated Users (S-1-5-11) are added by hand** (`_SESSION_SIDS`): they are
+  session SIDs the DC never returns in `tokenGroups`, but a takeover-grade right granted
+  to them is a real path for every domain user. On any failure the set still holds those
+  two, so Everyone/Auth-Users grants are matched regardless.
+- **`self_rights_from_sd(sd, my_sids)`** mirrors `analyze_sd` but keeps an ACE only when
+  its trustee ∈ `my_sids` (no `is_default_privileged` filter), reusing
+  `interpret_access_mask` so only takeover-grade rights count. It also returns
+  `owner_mine` (owning an object = implicit WriteDacl). Verify with the synthetic-SD
+  harness: a grant to Everyone/your-group must match; a grant to a stranger or to Domain
+  Admins (when *not* in your token) must not; a benign scoped `WriteProperty` must not.
+- **The scan is paged and spans every partition.** `_paged_search()` (cookie loop on
+  control `1.2.840.113556.1.4.319`) is used because one `(objectClass=*)` SD sweep over a
+  real domain far exceeds the server size limit — this is the *only* paged search in the
+  tool. Non-GC scans **every naming context rootDSE advertises** (`namingContexts` ∪
+  `configurationNamingContext`): the domain NC(s), **Configuration** (where Sites and the
+  whole AD CS config live), Schema, and the DomainDnsZones/ForestDnsZones app partitions.
+  This is deliberate — a right on a Configuration object (e.g. linking a GPO to a *site*
+  is a `gPLink` write on `CN=…,CN=Sites,CN=Configuration,…`) is invisible to any
+  domain-NC-only search, including the OU tree itself. GC mode scans the per-domain NCs +
+  Configuration (SDs may be partial over the GC port — noted, not errored). `_base_label()`
+  tags each partition's findings (e.g. `contoso.local (Configuration)`) so cross-partition
+  hits are distinguishable. `fetch_takeover` aggregates rights per object and records `via`
+  (which of your principals granted them — `resolve_sid`, with a cache pre-seeded so your
+  own SID resolves to `you (<name>)`). Objects outside the domain NC still attach inline
+  via `_host_node`, which climbs the DN to the domain-root node.
+
 ### The other enumeration modules
 
 All follow the same shape: an independent `--flag`, a `fetch_x()` returning per-domain

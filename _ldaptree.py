@@ -34,6 +34,7 @@ GREEN  = '\033[0;32m'
 YELLOW = '\033[1;33m'
 BLUE   = '\033[0;34m'
 PURPLE = '\033[0;35m'
+BPURPLE = '\033[1;35m'   # bold purple — reserved for "rights YOU hold" (--takeover)
 CYAN   = '\033[0;36m'
 GREY   = '\033[0;90m'
 NC     = '\033[0m'
@@ -357,6 +358,52 @@ def analyze_sd(sd_bytes):
     return owner_sid, results
 
 
+def self_rights_from_sd(sd_bytes, my_sids):
+    """Parse an SD → (owner_is_mine_sid_or_None, [(sid, rights, inherited)]).
+
+    Like analyze_sd, but instead of dropping default-privileged trustees it keeps
+    *only* ALLOW aces whose trustee is one of `my_sids` (the caller's own SID plus
+    every group in its token). This is the "what can I take over" view: a right the
+    caller holds — directly, via a group, or via Everyone/Authenticated-Users — is
+    exactly what makes an object controllable, regardless of whether the trustee is
+    otherwise a "default" principal. owner_is_mine is returned because owning an
+    object grants implicit WriteDacl.
+    """
+    sd = SR_SECURITY_DESCRIPTOR(data=sd_bytes)
+    owner_sid = None
+    try:
+        owner_sid = sd["OwnerSid"].formatCanonical()
+    except Exception:
+        pass
+    owner_mine = owner_sid if owner_sid in my_sids else None
+
+    results = []
+    dacl = sd["Dacl"]
+    if dacl:
+        for ace in dacl["Data"]:
+            if ace["AceType"] not in (ACCESS_ALLOWED_ACE.ACE_TYPE,
+                                      ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE):
+                continue  # skip DENY / audit aces
+            body = ace["Ace"]
+            sid  = body["Sid"].formatCanonical()
+            if sid not in my_sids:
+                continue
+
+            obj_guid = None
+            if ace["AceType"] == ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE:
+                if body["Flags"] & ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT:
+                    obj_guid = bin_to_string(body["ObjectType"]).lower()
+            obj_label = KNOWN_OBJECT_GUIDS.get(obj_guid,
+                                               obj_guid[:8] if obj_guid else None)
+
+            rights = interpret_access_mask(body["Mask"]["Mask"], obj_guid, obj_label)
+            if not rights:
+                continue
+            results.append((sid, rights, bool(ace["AceFlags"] & ACE_INHERITED)))
+
+    return owner_mine, results
+
+
 def resolve_sid(conn, sid, search_base, cache):
     """Resolve a SID to a readable name (well-known table, then LDAP lookup)."""
     if sid in cache:
@@ -419,6 +466,203 @@ def enrich_acls(conn, ou_data, search_base):
                 "rights":    agg[sid]["rights"],
                 "inherited": agg[sid]["inherited"],
             })
+
+
+# --- "what can I take over" (--takeover) -----------------------------------
+#
+# Everyone / Authenticated Users are session SIDs the DC does NOT return in
+# tokenGroups (they are added at authentication, not stored), but a takeover-grade
+# right granted to them still applies to the caller — so we seed them into the
+# token by hand.
+_SESSION_SIDS = {"S-1-1-0", "S-1-5-11"}   # Everyone, Authenticated Users
+
+
+def resolve_self_sids(conn, bind_user, base_dn):
+    """Return (my_sids:set, display_name, my_object_sid) for the bound identity.
+
+    Finds the caller's own object via the LDAP whoami extended operation (falling
+    back to the sAMAccountName parsed from the bind username), then reads
+    `tokenGroups` — the DC-computed set of every group SID in the caller's token,
+    fully transitive, including primary and built-in groups — plus its objectSid.
+    Everyone / Authenticated Users are always included. On any failure the set
+    still contains those two, so Everyone/Auth-Users grants are matched regardless.
+    """
+    my_sids = set(_SESSION_SIDS)
+    my_dn = sam = None
+
+    try:
+        who = conn.extend.standard.who_am_i()
+    except Exception:
+        who = None
+    if who:
+        low = who.lower()
+        if low.startswith("dn:"):
+            my_dn = who[3:]
+        elif low.startswith("u:"):
+            principal = who[2:]
+            if "\\" in principal:
+                sam = principal.split("\\", 1)[1]
+            elif "@" in principal:
+                sam = principal.split("@", 1)[0]
+            else:
+                sam = principal
+    if not my_dn and not sam:
+        if "\\" in bind_user:
+            sam = bind_user.split("\\", 1)[1]
+        elif "@" in bind_user:
+            sam = bind_user.split("@", 1)[0]
+        else:
+            sam = bind_user
+
+    display = sam or my_dn or bind_user
+
+    if not my_dn and sam and base_dn:
+        try:
+            conn.search(base_dn, f"(sAMAccountName={sam})", search_scope=SUBTREE,
+                        attributes=["objectSid"])
+            if conn.entries:
+                my_dn = str(conn.entries[0].entry_dn)
+        except LDAPException:
+            pass
+
+    my_objectsid = None
+    if my_dn:
+        ok = False
+        try:
+            conn.search(my_dn, "(objectClass=*)", search_scope=BASE,
+                        attributes=["tokenGroups", "objectSid"])
+            ok = True
+        except LDAPException:
+            ok = False
+        if ok and conn.entries:
+            e = conn.entries[0]
+            my_objectsid = _entry_sid(e)
+            if my_objectsid:
+                my_sids.add(my_objectsid)
+            try:
+                for raw in e["tokenGroups"].raw_values:
+                    try:
+                        my_sids.add(LDAP_SID(data=raw).formatCanonical())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    return my_sids, display, my_objectsid
+
+
+def _paged_search(conn, base, ldap_filter, attrs, controls=None, page=1000):
+    """Yield entries from a paged SUBTREE search.
+
+    Scanning every object's SD can far exceed the server's size limit, so unlike
+    the rest of the tool this search pages. Each page's entries are consumed before
+    the next request is issued, so conn.entries is never read stale.
+    """
+    cookie = None
+    while True:
+        try:
+            conn.search(search_base=base, search_filter=ldap_filter,
+                        search_scope=SUBTREE, attributes=attrs, controls=controls,
+                        paged_size=page, paged_cookie=cookie)
+        except LDAPException:
+            return
+        for e in conn.entries:
+            yield e
+        try:
+            cookie = conn.result["controls"]["1.2.840.113556.1.4.319"]["value"]["cookie"]
+        except (KeyError, TypeError, AttributeError):
+            cookie = None
+        if not cookie:
+            return
+
+
+def _obj_kind(entry):
+    """Coarse object class for display (most-specific first)."""
+    try:
+        classes = [str(c).lower() for c in entry["objectClass"].values]
+    except Exception:
+        return "object"
+    for cls, label in (("grouppolicycontainer", "GPO"), ("computer", "computer"),
+                       ("group", "group"), ("organizationalunit", "OU"),
+                       ("user", "user"), ("container", "container")):
+        if cls in classes:
+            return label
+    return classes[-1] if classes else "object"
+
+
+def _obj_name(entry):
+    """Best display name for an arbitrary object: sAMAccountName, name, then RDN."""
+    return (_attr_str(entry, "sAMAccountName") or _attr_str(entry, "name")
+            or str(entry.entry_dn).split(",", 1)[0])
+
+
+def _base_label(base):
+    """Human label for a naming context. Domain/DNS partitions (DC=…) render as the
+    DNS name; the Configuration/Schema partitions (CN=…) get the partition name
+    appended so their findings are distinguishable from the domain's."""
+    dom  = domain_from_base_dn(base)
+    head = base.split(",", 1)[0]
+    if head.upper().startswith("CN="):
+        return f"{dom} ({head[3:]})" if dom else head[3:]
+    return dom or base
+
+
+def fetch_takeover(conn, scan_bases, my_sids, cache):
+    """Per-domain list of objects the caller holds takeover-grade rights on.
+
+    Pages every object under each base, parses its DACL+Owner, and keeps only those
+    where the caller's token (my_sids) is granted a dangerous right (or owns the
+    object). Rights from the caller's several ACEs are unioned; `via` names which of
+    the caller's principals (self / a group / Everyone) actually granted them.
+    """
+    controls = security_descriptor_control(sdflags=0x05)  # DACL + Owner, no SACL
+    out = []
+    for base in scan_bases:
+        if not base:
+            continue
+        d = {"domain": _base_label(base), "objects": []}
+        for e in _paged_search(
+                conn, base, "(objectClass=*)",
+                ["nTSecurityDescriptor", "sAMAccountName", "objectClass", "name"],
+                controls=controls):
+            raw = _attr_raw(e, "nTSecurityDescriptor")
+            if not raw:
+                continue
+            try:
+                owner_mine, aces = self_rights_from_sd(raw, my_sids)
+            except Exception:
+                continue
+            if not owner_mine and not aces:
+                continue
+
+            rights, via = [], []
+            for sid, rlist, _inh in aces:
+                for r in rlist:
+                    if r not in rights:
+                        rights.append(r)
+                who = resolve_sid(conn, sid, base, cache)
+                if who not in via:
+                    via.append(who)
+            if owner_mine:
+                if "Owner" not in rights:
+                    rights.insert(0, "Owner")
+                who = resolve_sid(conn, owner_mine, base, cache)
+                if who not in via:
+                    via.append(who)
+
+            # inherited only if every contributing right is an inherited ACE and we
+            # aren't the (always-direct) owner.
+            inherited = bool(aces) and all(x[2] for x in aces) and not owner_mine
+            d["objects"].append({
+                "dn":        str(e.entry_dn),
+                "name":      _obj_name(e),
+                "kind":      _obj_kind(e),
+                "rights":    rights,
+                "via":       via,
+                "inherited": inherited,
+                "owner":     bool(owner_mine),
+            })
+        out.append(d)
+    return out
 
 
 def creators_from_sd(sd_bytes):
@@ -1357,6 +1601,15 @@ def _print_vuln_objects(node, indent, out):
               f"{RED}[{', '.join(o['labels'])}]{NC}{star}", file=out)
 
 
+def _print_takeover_objects(node, indent, out):
+    """Print the objects the caller can take over, hung under a tree node (--takeover)."""
+    for o in sorted(node.get("takeover_objects", []), key=lambda x: x["name"].lower()):
+        inh = f" {GREY}(inherited){NC}" if o.get("inherited") else ""
+        print(f"{indent}{BPURPLE}⚑ YOU{NC} {PURPLE}{o['name']} {GREY}({o['kind']}){NC} "
+              f"{BPURPLE}[{', '.join(o['rights'])}]{NC} {PURPLE}via {', '.join(o['via'])}{NC}{inh}",
+              file=out)
+
+
 def print_ou(item, depth, extra_indent, out):
     indent = "  " * (depth + extra_indent)
     if item.get("is_container"):
@@ -1377,6 +1630,7 @@ def print_ou(item, depth, extra_indent, out):
         inh    = f" {GREY}(inherited){NC}{RED}" if ace["inherited"] else ""
         print(f"{indent}    {RED}! {rights} → {ace['who']}{inh}{NC}", file=out)
     _print_vuln_objects(item, indent + "    ", out)
+    _print_takeover_objects(item, indent + "    ", out)
 
 
 def _host_node(obj_dn, index):
@@ -1409,6 +1663,24 @@ def attach_vuln_objects(ou_data, root_item, domains, vuln_info):
                 host["vuln_objects"].append(o)
 
 
+def attach_takeover_objects(ou_data, root_item, domains, takeover_info):
+    """Hang each controllable object under its nearest ancestor tree node so
+    print_tree can show it inline (same placement scheme as --vuln)."""
+    index = {item["dn"].lower(): item for item in ou_data}
+    if root_item and root_item.get("dn"):
+        index[root_item["dn"].lower()] = root_item
+    if domains:
+        for dom in domains.values():
+            index[dom["dn"].lower()] = dom
+    for node in index.values():
+        node.setdefault("takeover_objects", [])
+    for d in takeover_info:
+        for o in d.get("objects", []):
+            host = _host_node(o["dn"], index)
+            if host is not None:
+                host["takeover_objects"].append(o)
+
+
 def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
     out = out or sys.stdout
     if not ou_data:
@@ -1425,6 +1697,7 @@ def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
     if root_item:
         print(f"{root_item['name']}{format_counts(root_item)}{format_maq(root_item)}", file=out)
         _print_vuln_objects(root_item, "    ", out)
+        _print_takeover_objects(root_item, "    ", out)
 
     if domains:
         # GC mode: group OUs by domain, each domain is its own subtree
@@ -1438,6 +1711,7 @@ def print_tree(ou_data, base_dn, root_item=None, domains=None, out=None):
                 print("\n" * 1, file=out)  # 1 newline + the implicit one = 2 blank lines
             print(f"  +-- {domain_item['name']} {GREY}[{domain_item['dn']}]{NC}{format_counts(domain_item)}{format_maq(domain_item)}", file=out)
             _print_vuln_objects(domain_item, "      ", out)
+            _print_takeover_objects(domain_item, "      ", out)
             for item in sorted(by_domain.get(domain_dn, []), key=lambda x: [p.lower() for p in x["path"]]):
                 print_ou(item, len(item["path"]) - 1, extra_indent=2, out=out)
     else:
@@ -1510,6 +1784,31 @@ def print_dcsync(dcsync_info, out=None):
             else:
                 have = " + ".join(sorted(p["rights"]))
                 print(f"    {YELLOW}!  {have} (partial — not enough alone) → {p['who']}{NC}", file=out)
+
+
+def print_takeover(takeover_info, my_name, out=None):
+    """Print, prominently in purple, every object the caller can take over."""
+    out = out or sys.stdout
+    total = sum(len(d["objects"]) for d in takeover_info)
+    print("", file=out)
+    print(f"{BPURPLE}Objects YOU can take over — takeover-grade rights held by "
+          f"{my_name}{NC}", file=out)
+    print(f"Controllable objects: {total}", file=out)
+    print("=" * 60, file=out)
+    if not total:
+        print("None — your identity holds no takeover-grade rights on any object.", file=out)
+        return
+    for d in takeover_info:
+        if not d["objects"]:
+            continue
+        print(d["domain"], file=out)
+        for o in sorted(d["objects"], key=lambda x: x["name"].lower()):
+            rights = ", ".join(o["rights"])
+            via    = ", ".join(o["via"])
+            inh    = f" {GREY}(inherited){NC}" if o["inherited"] else ""
+            print(f"    {BPURPLE}★ {rights}{NC} {PURPLE}→ {o['name']} "
+                  f"{GREY}({o['kind']}){NC} {PURPLE}via {via}{NC}{inh}", file=out)
+            print(f"      {GREY}{o['dn']}{NC}", file=out)
 
 
 def print_vuln(vuln_info, out=None):
@@ -1753,7 +2052,8 @@ def main():
     parser.add_argument("--trusts",         action="store_true",             help="Enumerate domain/forest trusts (direction, type, transitivity, SID filtering)")
     parser.add_argument("--computers",      action="store_true",             help="List computer accounts with OS, flagging end-of-life OSes and stale accounts")
     parser.add_argument("--adcs",           action="store_true",             help="Enumerate AD CS CAs and certificate templates, flagging ESC1/2/3/4/9 misconfigurations. Requires impacket")
-    parser.add_argument("-A", "--all",      action="store_true",             help="Enable every enumeration module (--acl --vuln --groups --creds --trusts --computers --adcs)")
+    parser.add_argument("--takeover",       action="store_true",             help="Scan every object's ACL and show (in purple) the objects the current user can take over — takeover-grade rights held by you, your groups, or Everyone/Authenticated Users. Requires impacket")
+    parser.add_argument("-A", "--all",      action="store_true",             help="Enable every enumeration module (--acl --vuln --groups --creds --trusts --computers --adcs --takeover)")
     parser.add_argument("--no-ldaps",       action="store_true",             help="Use plain LDAP (port 389/3268) instead of LDAPS")
     parser.add_argument("--version",        action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
@@ -1769,10 +2069,10 @@ def main():
 
     if args.all:
         args.acl = args.vuln = args.groups = args.creds = True
-        args.trusts = args.computers = args.adcs = True
+        args.trusts = args.computers = args.adcs = args.takeover = True
 
-    if (args.acl or args.adcs) and not HAS_IMPACKET:
-        log_error("--acl/--adcs require impacket. Install it with: pip install impacket")
+    if (args.acl or args.adcs or args.takeover) and not HAS_IMPACKET:
+        log_error("--acl/--adcs/--takeover require impacket. Install it with: pip install impacket")
         sys.exit(1)
 
     if args.verbose:
@@ -1932,6 +2232,8 @@ def main():
     trust_info = []
     comp_info = []
     adcs_info = None
+    takeover_info = []
+    my_name = None
     if args.acl:
         # Resolve trustee SIDs against the DC's own domain NC (rootDSE default).
         acl_base = rootdse.get("defaultNamingContext") or args.base_dn or (
@@ -1992,6 +2294,43 @@ def main():
         log_verbose(f"Enumerating AD CS under {config_nc or '(unknown config NC)'}", args.verbose)
         adcs_info = fetch_adcs(conn, config_nc, adcs_base, {})
 
+    if args.takeover:
+        # Resolve trustee SIDs and the caller's own object against the DC's domain NC.
+        self_base = rootdse.get("defaultNamingContext") or args.base_dn or (
+            naming_contexts[0] if naming_contexts else "")
+        log_verbose("Resolving the current user's effective token (whoami + tokenGroups)",
+                    args.verbose)
+        my_sids, my_name, my_objectsid = resolve_self_sids(conn, bind_user, self_base)
+        log_verbose(f"Effective token for {my_name}: {len(my_sids)} SID(s)", args.verbose)
+        if args.gc:
+            log_verbose("GC mode: object SDs may be partial over the GC port — "
+                        "takeover results can be incomplete", args.verbose)
+        # Scan EVERY naming context the DC exposes, not just the domain NC: Sites
+        # and the whole AD CS config live in the Configuration partition, so rights
+        # there (e.g. linking a GPO to a site = a gPLink write on a Configuration
+        # object) are only caught if we look outside the domain head. namingContexts
+        # from rootDSE already lists Configuration/Schema/DomainDnsZones/ForestDnsZones;
+        # configurationNamingContext is added defensively in case it wasn't advertised.
+        if args.gc:
+            candidate_ncs = list(naming_contexts)
+        else:
+            candidate_ncs = list(rootdse.get("namingContexts", [])) or [args.base_dn]
+        cnc = rootdse.get("configurationNamingContext")
+        if cnc:
+            candidate_ncs.append(cnc)
+        scan_bases, _seen = [], set()
+        for b in candidate_ncs:
+            if b and b.lower() not in _seen:
+                _seen.add(b.lower())
+                scan_bases.append(b)
+        cache = {my_objectsid: f"you ({my_name})"} if my_objectsid else {}
+        log_verbose(f"Scanning every object under {scan_bases} for rights you hold",
+                    args.verbose)
+        takeover_info = fetch_takeover(conn, scan_bases, my_sids, cache)
+        attach_takeover_objects(ou_data, root, domains, takeover_info)
+        log_verbose(f"You can take over "
+                    f"{sum(len(d['objects']) for d in takeover_info)} object(s)", args.verbose)
+
     for count_key, ldap_filter in [
         ("computer_count", "(objectClass=computer)"),
         ("user_count",     "(&(objectClass=user)(!(objectClass=computer)))"),
@@ -2043,6 +2382,8 @@ def main():
 
     def emit(out):
         print_tree(ou_data, args.base_dn, root_item=root, domains=domains, out=out)
+        if args.takeover:
+            print_takeover(takeover_info, my_name, out=out)
         if args.acl:
             print_gpo_acls(gpo_items, out=out)
             print_gpo_creators(gpo_creators, out=out)
