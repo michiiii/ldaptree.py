@@ -7,7 +7,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 try:
-    from ldap3 import Server, Connection, ALL, NONE, SUBTREE, BASE, NTLM, SIMPLE
+    from ldap3 import (
+        Server, Connection, ALL, NONE, SUBTREE, BASE, NTLM, SIMPLE,
+        TLS_CHANNEL_BINDING,
+    )
     from ldap3.core.exceptions import LDAPException
     from ldap3.protocol.microsoft import security_descriptor_control
 except ImportError:
@@ -1844,10 +1847,17 @@ def main():
         bind_method = SIMPLE
         log_verbose(f"Using simple bind as {bind_user}", args.verbose)
 
+    # AD can require a channel-binding token for NTLM over LDAPS. ldap3 computes
+    # it from the server certificate when this option is enabled.
+    bind_options = {}
+    if use_ssl and bind_method == NTLM:
+        bind_options["channel_binding"] = TLS_CHANNEL_BINDING
+        log_verbose("Enabling TLS channel binding for NTLM", args.verbose)
+
     try:
         conn = Connection(server, user=bind_user, password=bind_secret,
                           authentication=bind_method, auto_bind=True,
-                          receive_timeout=30)
+                          receive_timeout=30, **bind_options)
     except LDAPException as e:
         log_error(f"Connection/auth failed: {e}")
         if bare_sam and not args.domain and not args.hash:
@@ -2007,7 +2017,7 @@ def main():
             _ldap_srv = Server(args.server, use_ssl=use_ssl, get_info=NONE)
             ldap_conn = Connection(_ldap_srv, user=bind_user, password=bind_secret,
                                    authentication=bind_method, auto_bind=True,
-                                   receive_timeout=10)
+                                   receive_timeout=10, **bind_options)
             log_verbose(f"Opened regular LDAP connection for MAQ query ({local_nc})", args.verbose)
         except Exception as _e:
             log_verbose(f"Could not open regular LDAP connection: {_e}", args.verbose)

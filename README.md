@@ -80,6 +80,10 @@ ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -H $AD_USER_HASH
 
 `-H` takes a bare NT hash (`32 hex`) or a full `LM:NT` pair, and forces NTLM (pass-the-hash can't use simple bind, which sends a cleartext password). The `DOMAIN\user` principal is taken from `-u` if you supply it, otherwise from `-d`, otherwise the discovered DNS domain — pass `-d NETBIOS` if the DNS domain is rejected.
 
+NTLM over LDAPS automatically uses TLS channel binding, including on domain
+controllers configured with “LDAP server channel binding token requirements:
+Always”.
+
 **Global Catalog** — enumerate the entire forest (all domains) via GC port 3269/3268:
 
 ```bash

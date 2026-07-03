@@ -58,6 +58,8 @@ each own one enrichment concern:
    forces NTLM (simple bind would send the hash as a cleartext password) and needs a
    `DOMAIN\user` principal, derived from `-u` / `-d` / the discovered DNS domain. Verify
    changes against `NtlmClient.ntowf_v2` directly, as the test harness does — no DC needed.
+   NTLM over LDAPS also passes `channel_binding=TLS_CHANNEL_BINDING`, which is required
+   when the DC's LDAP channel-binding policy is set to `Always`.
 3. **Fetch OUs** — one SUBTREE search for `organizationalUnit` (plus `container` when
    `--containers` is set), pulling `gPLink`. `build_tree()` turns each entry's DN into
    a root→leaf `path`, and drops anything under a known system container

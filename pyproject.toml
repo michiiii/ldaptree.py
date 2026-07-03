@@ -9,7 +9,7 @@ description = "Enumerate Active Directory OU structure as a hierarchical tree"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "ldap3",
+    "ldap3>=2.10.2rc4", # stable 2.9.1 lacks TLS channel binding; required by DCs enforcing CBT
     "pycryptodome",
     "impacket",      # parses the nTSecurityDescriptor blob for --acl
 ]
