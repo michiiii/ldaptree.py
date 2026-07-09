@@ -101,16 +101,67 @@ them floods the output with noise, tightening them hides real delegations:
   Account Operators in particular has default CreateChild/DeleteChild on user/
   group/computer classes on every OU — omitting it was the bug that made the first
   cut of `--acl` report default ACEs as findings. Everyone else is shown.
+  **RIDs 526/527 (Key Admins / Enterprise Key Admins)** are the same category of
+  bug, found later: both groups get a standing, inherited `AddKeyCredentialLink`
+  ACE at the domain root by design (Windows Hello for Business / key-trust
+  support) that shows up on *every* OU underneath — noise, not a delegation.
+  Like Group Policy Creator Owners (520), both groups are empty by default, so
+  they're *also* in `PRIV_GROUPS` (`--groups`) — the real signal is whether
+  someone was added to them, not the standing ACE. Don't drop 526/527 from
+  `DEFAULT_PRIVILEGED_RIDS` without keeping the `PRIV_GROUPS` entries, or a
+  membership escalation into either group goes undetected everywhere.
 - **`enrich_acls()` aggregates per trustee.** AD splits one logical delegation into
   several object-scoped ACEs (e.g. CreateChild per child class), so findings are
   unioned per SID into a single line; `(inherited)` is shown only when *all* of a
   trustee's ACEs are inherited. Don't revert to one-line-per-ACE — it produces the
   duplicate rows that hid the real finding.
 - **`interpret_access_mask()`** returns only takeover-grade rights. Full control
-  collapses to `GenericAll`. Property/extended-right writes are reported only when
-  *unscoped* (all attributes) or scoped to a known-dangerous attribute — the only
-  entry in `KNOWN_OBJECT_GUIDS` is **gPLink** (`f30e3bbe-…`), whose write is the
-  GPO-link takeover primitive. A write scoped to one benign attribute is ignored.
+  collapses to `GenericAll`. Property writes are reported only when *unscoped*
+  (`WriteProperty(All)`) or scoped to a known-dangerous attribute in
+  `KNOWN_OBJECT_GUIDS`, under its **canonical BloodHound/SharpHound edge name**
+  (not the raw schema attribute name — a finding should read as an action, not
+  send the reader to look up a GUID): **WriteGPLink** (GPO-link takeover),
+  **WriteSPN** (add an SPN → targeted Kerberoasting), **AddKeyCredentialLink**
+  (Shadow Credentials), **AddAllowedToAct** and **WriteAccountRestrictions**
+  (two separate paths to the same RBCD primitive — the latter is a property
+  *set* that also grants other account-restriction writes, commonly delegated
+  to whoever joins a computer via ADUC), and **AddMember** (add a principal to
+  a group). A write scoped to any other, benign attribute is ignored. These
+  same primitives can show up encoded as either `WRITE_PROP` (0x20) or, for
+  "validated writes" like WriteSPN (e.g. granted via the ADUC delegation
+  wizard), `ADS_RIGHT_DS_SELF` (0x8) against the *same* GUID — both mask bits
+  are checked and collapse to the identical label, deduplicated within one ACE,
+  since the exploitation is identical regardless of which bit AD used. Don't
+  drop the `SELF` branch — it's the more common real-world encoding even though
+  impacket's own `dacledit` sometimes reports the `WRITE_PROP` form for the same
+  right. **Unscoped `SELF`** (no GUID at all) is a distinct primitive,
+  `AddSelf` — the trustee can add itself to a group's `member` attribute,
+  without needing rights over arbitrary members like `AddMember` does.
+  **`MEMBER_ATTRIBUTE_GUID` (the same GUID as the `member` attribute, i.e.
+  `AddMember`'s entry in `KNOWN_OBJECT_GUIDS`) is the one deliberate exception
+  to "both bits collapse to the identical label."** It doubles as the rightsGUID
+  for the separate, DC-enforced "Self-Membership" validated write, which
+  constrains the trustee to add/remove only *itself* — a materially narrower
+  primitive than `WriteProperty(member)`'s "add anyone." So `SELF` scoped to
+  this one GUID is special-cased to `AddSelf`, same as the unscoped case,
+  *before* falling through to the generic `KNOWN_OBJECT_GUIDS` reuse that every
+  other entry (WriteSPN, AddKeyCredentialLink, …) legitimately gets. Confirmed
+  against SpecterOps' AddSelf/AddMember edge docs. This was a real bug found
+  during review: collapsing it to `AddMember` overstates what a Self-Membership
+  grant lets the trustee do.
+  **`KNOWN_CONTROL_ACCESS_GUIDS`** is the same pattern one level up: extended
+  rights gated by `ACE_DS_CONTROL_ACCESS` (0x100) rather than a property write.
+  Its one entry, **ForceChangePassword** (`User-Force-Change-Password`), used to
+  be silently dropped whenever it was scoped to that one right instead of
+  granted as unscoped `AllExtendedRights` — that was a real gap, since this is
+  one of the single most common ACL findings in practice. Kept as a separate
+  table from `KNOWN_OBJECT_GUIDS` (different mask bit, different GUID
+  namespace) and from `DS_REPL_GET_CHANGES`/`_ALL` (DCSync needs *both* of
+  those rights together, a combination this flat GUID→label map can't express,
+  so it stays in its own dedicated function). None of these tables are
+  OU-specific: `--takeover`'s all-object scan hits them on users/computers/
+  groups too (e.g. a computer account's WriteSPN ACE, or ForceChangePassword on
+  a user), which is where most of these besides WriteGPLink actually fire.
 
 Only ALLOW aces are considered (DENY/audit skipped). Owner is surfaced separately
 when non-default (an owner has implicit WriteDacl). The synthetic-SD round-trip in
@@ -126,6 +177,57 @@ in sync). The rationale is the attack path: write access to a GPO object = code
 execution on every OU it's linked to, and an over-permissioned GPO is invisible in
 the OU tree otherwise. RID 520 (Group Policy Creator Owners) is in the default set
 specifically for this — it holds full control over GPOs by default.
+
+**Sites get the same treatment, for the same reason, and were a real gap found
+against an HTB lab.** `--acl`'s main search only covers `organizationalUnit`
+(`+ container`) under the domain NC — it never sees `CN=Sites,CN=Configuration,…`,
+so a non-default ACE on e.g. `Default-First-Site-Name` was previously invisible to
+`--acl` entirely, even though `--takeover`'s Configuration-NC scan already covered
+this for the *caller's own* rights (see the `--takeover` section above). A site can
+carry its own `gPLink`, so write access to a site object is exactly as dangerous as
+write access to an OU or GPO: link an attacker GPO to the site and it applies to
+every computer AD considers part of it. `fetch_site_acls(conn, config_nc)` searches
+`CN=Sites,<config_nc>` for `(objectClass=site)`, shapes records as `name`/`dn`/
+`_sd_raw` (dn is used instead of a GUID — sites don't have one), and reuses
+`enrich_acls()`/`print_site_acls()` unchanged, wired into the `if args.acl:` block
+in `main()` and `emit()` right after the GPO ACL section. `config_nc` (rootDSE's
+`configurationNamingContext`, falling back to `CN=Configuration,<rootDomainNamingContext>`)
+is now computed once and shared between `--acl` and `--adcs` rather than duplicated —
+Sites live in the same Configuration NC as CAs/templates. Verify with a mock-conn
+test (search base must be `CN=Sites,<config_nc>`, filter `(objectClass=site)`) plus
+the same synthetic-SD `enrich_acls()` round-trip used for OUs/GPOs.
+
+### Arbitrary object ACLs (`--object-acls`) — a third gap, found the same way
+
+`--acl` (OUs/GPOs/Sites) and `--takeover` (every object, but self-only) both scan
+security descriptors — but neither can surface a plain delegation *between two
+other principals* on a plain user/computer/group object, e.g. `restituyoN` holding
+`AddKeyCredentialLink` on `tangui` (found via PowerView's `Get-DomainObjectAcl` on
+an HTB lab; `--acl` never touches non-OU/GPO/Site objects, and `--takeover` would
+only show it if bound as `restituyoN` or one of their groups). This is the
+BloodHound-ACL-edge view: every non-default trustee on every principal object, not
+just the caller's.
+
+`--object-acls` is its own flag, not folded into `--acl`, because the cost profile
+is different: it's a paged sweep (`_paged_search`, the same mechanism `--takeover`
+uses) over every `person`/`computer`/`group`/`msDS-GroupManagedServiceAccount`
+object in the domain NC(s) (`OBJECT_ACL_FILTER`) — real traffic and potentially a
+lot of output on a live domain, unlike the OU/GPO/Site sweep which touches a much
+smaller object count. Scope is deliberately the domain NC(s) (`naming_contexts`),
+*not* the full multi-partition sweep `--takeover` needs — principals never live in
+Configuration/Schema/DomainDnsZones/ForestDnsZones, so there's nothing to gain
+scanning those here.
+
+`fetch_object_acls()` reuses `analyze_sd()` for the non-default-trustee filter
+(same as OUs/GPOs/Sites) and a new shared helper, **`_aggregate_trustee_aces()`**
+— the per-trustee union-of-rights/owner-surfacing logic that used to live inline
+in `enrich_acls()` only. `enrich_acls()` now calls the same helper; behavior for
+OUs/GPOs/Sites is unchanged, this just removes what had become two copies of a
+non-trivial aggregation once a second caller needed it. `print_object_acls()`
+follows the flat per-domain listing shape used elsewhere (`print_gpo_acls`-style),
+not the tree-inline-annotation one `--vuln`/`--takeover` use — kept consistent
+with the "other enumeration modules" pattern below rather than reusing
+`_host_node`, since there was no indication inline attachment was wanted here.
 
 **"Who can create GPOs" is a container-ACL question, not an object one.** Creating a
 GPO needs `CreateChild` on `CN=Policies,CN=System,<nc>`, held by default only by
@@ -156,23 +258,30 @@ All four `--acl` sections (OU ACEs, GPO ACEs, GPO-creation, DCSync) print via th
 
 ### Attack surface (`--vuln`) — independent of `--acl`
 
-`fetch_vuln()` runs five per-domain LDAP searches; `print_vuln()` renders them. It is
+`fetch_vuln()` runs per-domain LDAP searches; `print_vuln()` renders them. It is
 gated on its own flag (not `--acl`) and does **not** require impacket except for
-resolving RBCD trustees — `_rbcd_principals()` swallows a NameError if impacket is
-absent, so `--vuln` still lists the RBCD accounts, just without the "acted on by"
-names. The searches key off `userAccountControl` via the bitwise-AND matching rule
-(`LDAP_MATCHING_RULE_BIT_AND` = `1.2.840.113556.1.4.803`): AS-REP = `0x400000`,
-unconstrained = `0x80000` with `SERVER_TRUST_ACCOUNT 0x2000` cleared (plus
-primaryGroupID 516/521 excluded) to drop DCs/RODCs, constrained = presence of
-`msDS-AllowedToDelegateTo` with `0x1000000` flagging protocol transition, RBCD =
-presence of `msDS-AllowedToActOnBehalfOfOtherIdentity` (an SD blob, parsed like any
-DACL). Kerberoast filters on `sAMAccountType=805306368` (user, not computer) with an
-SPN, minus krbtgt and gMSAs. Delegation checks intentionally cover users **and**
+resolving RBCD trustees and SID History — `_rbcd_principals()` swallows a NameError
+if impacket is absent, so `--vuln` still lists the RBCD accounts (and SID-History
+count), just without the "acted on by"/resolved-SID names. The searches key off
+`userAccountControl` via the bitwise-AND matching rule (`LDAP_MATCHING_RULE_BIT_AND`
+= `1.2.840.113556.1.4.803`): AS-REP = `0x400000`, unconstrained = `0x80000` with
+`SERVER_TRUST_ACCOUNT 0x2000` cleared (plus primaryGroupID 516/521 excluded) to drop
+DCs/RODCs, constrained = presence of `msDS-AllowedToDelegateTo` with `0x1000000`
+flagging protocol transition, RBCD = presence of
+`msDS-AllowedToActOnBehalfOfOtherIdentity` (an SD blob, parsed like any DACL).
+Kerberoast filters on `sAMAccountType=805306368` (user, not computer) with an SPN,
+minus krbtgt and gMSAs. Delegation checks intentionally cover users **and**
 computers (labelled), since constrained delegation on service *user* accounts is the
-common case. Filters are assembled with f-strings — the mock-conn paren-balance test
-in the harness is the guard against interpolation typos. Note: searches are not paged
-(consistent with the rest of the tool), so very large result sets hit the server's
-size limit — raise paging here if a domain has >1000 kerberoastable users.
+common case. **SID History** (`sIDHistory=*`) is deliberately *not*
+`sAMAccountType`-restricted — groups and computers can carry migration leftover SIDs
+too (BloodHound's `HasSIDHistory` edge is equally class-agnostic); each raw SID is
+decoded with impacket's `LDAP_SID` and run through `resolve_sid()`, which usually
+just returns the SID string unresolved since it points into a *different* domain —
+that's expected and still useful (it shows the origin domain). Filters are assembled
+with f-strings — the mock-conn paren-balance test in the harness is the guard against
+interpolation typos. Note: searches are not paged (consistent with the rest of the
+tool), so very large result sets hit the server's size limit — raise paging here if a
+domain has >1000 kerberoastable users.
 
 **`--vuln` also annotates the OU tree inline.** Besides the flat per-category section,
 `fetch_vuln()` builds `d["objects"]` (keyed by DN, one entry per object with all its
@@ -225,8 +334,25 @@ Three load-bearing pieces:
   tags each partition's findings (e.g. `contoso.local (Configuration)`) so cross-partition
   hits are distinguishable. `fetch_takeover` aggregates rights per object and records `via`
   (which of your principals granted them — `resolve_sid`, with a cache pre-seeded so your
-  own SID resolves to `you (<name>)`). Objects outside the domain NC still attach inline
-  via `_host_node`, which climbs the DN to the domain-root node.
+  own SID resolves to `you (<name>)`) plus `nc` (the naming context the object was found
+  under, from the `scan_bases` loop var). Objects genuinely inside the domain NC but not
+  shown as their own tree node (e.g. `CN=Users`) still attach inline via `_host_node`,
+  falling through to the domain root — that's intentional. But `_host_node` climbs DN
+  *string* suffixes with no partition awareness, and DomainDnsZones/ForestDnsZones/
+  Configuration/Schema DNs (e.g. `DC=DomainDnsZones,DC=inlanefreight,DC=local`) happen to
+  textually **end with** the domain's own DN despite being separate naming contexts, not
+  real descendants of it — so without a boundary, a DNS zone or Configuration object
+  (Sites, cert templates, …) would climb straight past its own partition head and
+  misattach under the domain root, cluttering the main tree with unrelated partitions.
+  `_host_node(dn, index, nc_head=...)` takes the object's own `nc` as a stop boundary:
+  once the climb reaches `nc_head` without a match, it returns `None` instead of
+  continuing into whatever partition happens to share that DN suffix. Real domain-NC
+  objects are unaffected (their `nc_head` *is* the domain root, which *is* indexed, so
+  it's found in the same step the boundary is checked). Cross-partition objects still
+  appear in the flat "Objects YOU can take over" section (via `_base_label`) — they just
+  don't attach inline anymore. `attach_vuln_objects` calls `_host_node` with no `nc_head`
+  (unaffected/unchanged): `--vuln`'s searches never leave the real domain NCs, so it
+  doesn't hit this.
 
 ### The other enumeration modules
 
@@ -258,27 +384,41 @@ verification recipe (no live DC needed).
 `fetch_adcs()` reads the Configuration NC (`configurationNamingContext`, or derived as
 `CN=Configuration,<rootDomainNamingContext>`): `pKIEnrollmentService` objects (CAs, with
 their published `certificateTemplates`) and `pKICertificateTemplate` objects. Template
-DACLs are parsed by `template_sd_rights()` → (enrollers, writers), keying enrollment off
-the `Certificate-Enrollment` extended-right GUID (`CERT_ENROLL_GUID`) plus GenericAll.
-`_evaluate_template()` maps attributes to ESC labels: ESC1 needs *all* of
-enrollee-supplies-subject + auth-EKU + no-approval + no-RA-sig + a non-default enroller;
-ESC2/3 by EKU; ESC4 from *low-priv* writers; ESC9 from the no-security-extension bit.
-`present` is set true if either the CA or template container was readable. ESC6/8/11 are
-deliberately out of scope (not LDAP-observable) and the printer says so — don't add them
-as false "clear" signals.
+DACLs are parsed by `template_sd_rights()` → (enrollers, writers, flag_writers), keying
+enrollment off the `Certificate-Enrollment` extended-right GUID (`CERT_ENROLL_GUID`)
+plus GenericAll. `_evaluate_template()` maps attributes to ESC labels: ESC1 needs *all*
+of enrollee-supplies-subject + auth-EKU + no-approval + no-RA-sig + a non-default
+enroller; ESC2/3 by EKU; ESC4 from *low-priv* writers; ESC9 from the no-security-extension
+bit. `present` is set true if either the CA or template container was readable. ESC6/8/11
+are deliberately out of scope (not LDAP-observable) and the printer says so — don't add
+them as false "clear" signals.
 
 **ESC4 and ESC7 gate on `is_low_priv()`, not `is_default_privileged()`.** This was a
 real false-positive bug: the built-in default templates (User, Computer, Basic EFS, …)
 grant object-wide write only to DA/EA and grant broad principals at most a scoped
 `WriteProperty`, and the CA object is controlled by the CA's own host machine account
 (e.g. `DC04$`). "Non-default" let all of those through. So `template_sd_rights()` counts
-only object-wide writes (GenericAll/GenericWrite/WriteDacl/WriteOwner — **not**
-WriteProperty), and ESC4/ESC7 fire only when the writer is a genuinely low-privileged,
-attacker-reachable principal (`LOW_PRIV_SIDS`/`LOW_PRIV_RIDS`: Everyone, Auth Users,
-Domain Users/Computers, Users, Guests). Cost: a delegation to a *custom* admin group is
-not flagged — an accepted trade to keep the section signal-only. The synthetic-SD +
-`_evaluate_template` truth-table test (default-template scenario must yield no ESC4) is
-what protects this.
+only object-wide writes (GenericAll/GenericWrite/WriteDacl/WriteOwner — **not** a
+WriteProperty scoped to an arbitrary attribute), and ESC4/ESC7 fire only when the writer
+is a genuinely low-privileged, attacker-reachable principal (`LOW_PRIV_SIDS`/
+`LOW_PRIV_RIDS`: Everyone, Auth Users, Domain Users/Computers, Users, Guests). Cost: a
+delegation to a *custom* admin group is not flagged — an accepted trade to keep the
+section signal-only. The synthetic-SD + `_evaluate_template` truth-table test
+(default-template scenario must yield no ESC4) is what protects this.
+
+**`flag_writers` is the one deliberate exception to "WriteProperty never counts for
+ESC4."** A scoped write limited to *just* `msPKI-Certificate-Name-Flag`
+(`WritePKINameFlag`) or `msPKI-Enrollment-Flag` (`WritePKIEnrollmentFlag`, GUIDs in
+`FLAG_ATTRIBUTE_GUIDS`) lets a low-priv principal flip exactly the bits
+`_evaluate_template()` checks (enrollee-supplies-subject / manager-approval /
+no-security-extension) — i.e. self-inflict ESC1/ESC9 — without needing full
+GenericWrite. That's functionally ESC4 even though it's a single-attribute write, so
+`fetch_adcs` merges low-priv `flag_writers` into the same list passed to
+`_evaluate_template`'s `low_writers` parameter (which fires ESC4), while still
+reporting the two separately in the template record (`writers` vs `flag_writers`) so
+`print_adcs` shows *which* right actually enabled it. A SID already in `writers`
+(object-wide) is excluded from `flag_writers` to avoid double-reporting the same
+principal under two labels.
 
 **Recursive counts are computed client-side, not by the server.** `fetch_counts()`
 does one subtree search per object class and buckets each hit by its *immediate*

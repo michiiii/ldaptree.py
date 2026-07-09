@@ -15,7 +15,7 @@ git clone https://github.com/michiiii/ldaptree.py
 pipx install ./ldaptree.py
 ```
 
-`pycryptodome` (NTLM auth on Python 3.14+ / modern OpenSSL that no longer exposes MD4) and `impacket` (parsing the `nTSecurityDescriptor` blob for `--acl` / `--adcs` / `--takeover`) are installed automatically as dependencies.
+`pycryptodome` (NTLM auth on Python 3.14+ / modern OpenSSL that no longer exposes MD4) and `impacket` (parsing the `nTSecurityDescriptor` blob for `--acl` / `--object-acls` / `--adcs` / `--takeover`) are installed automatically as dependencies.
 
 ## Usage
 
@@ -43,7 +43,8 @@ Only three arguments are required. Everything else is resolved automatically:
 | `-v`, `--verbose` | Verbose logging |
 | `--gc` | Query the Global Catalog (port 3269/3268) for forest-wide enumeration |
 | `--containers` | Include well-known containers (`CN=Users`, `CN=Computers`, …) in the tree |
-| `--acl` | Flag non-default / abusable ACEs on OUs, GPOs, GPO-creation, and DCSync (requires impacket) |
+| `--acl` | Flag non-default / abusable ACEs on OUs, GPOs, Sites, GPO-creation, and DCSync (requires impacket) |
+| `--object-acls` | Scan every user/computer/group(/gMSA) object for non-default ACEs held by *any* principal — arbitrary delegations between two other accounts, not just yours (requires impacket) |
 | `--vuln` | Kerberoast / AS-REP roast, delegation (unconstrained/constrained/RBCD), weak account flags, and secrets in description fields |
 | `--groups` | *Added* (non-default) transitive members of privileged groups (Domain/Enterprise Admins, operators, DnsAdmins, …) |
 | `--creds` | LAPS local-admin passwords and gMSA managed passwords readable by the current user |
@@ -184,6 +185,31 @@ DCSync (replicating secrets to dump every password hash, including `krbtgt`) nee
 
 > Reading the DACL is a normal authenticated read — no elevated privilege is needed. The SACL is never requested, so `SeSecurityPrivilege` is not required.
 
+## Arbitrary object ACLs (`--object-acls`)
+
+`--acl` only looks at OUs, GPOs, and Sites. It won't show a delegation between two
+*other* accounts on a plain user/computer/group object — e.g. one low-privileged
+user holding `AddKeyCredentialLink` on another, the kind of edge PowerView's
+`Get-DomainObjectAcl` or BloodHound would surface:
+
+```bash
+ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -p $AD_USER_PASS --object-acls
+```
+
+```
+Object ACLs — non-default rights on users/computers/groups
+============================================================
+inlanefreight.local
+  tangui (user) [CN=tangui,CN=Users,DC=inlanefreight,DC=local]
+    ! AddKeyCredentialLink → restituyo
+```
+
+`--object-acls` pages every `person`/`computer`/`group`/gMSA object in the domain
+(the same mechanism `--takeover` uses to sweep every object, but scoped to the
+domain NC and reporting every non-default trustee rather than just the current
+user's). It's a separate flag from `--acl` because it's real full-domain traffic —
+expect it to take noticeably longer on a large domain.
+
 ## Attack surface (`--vuln`)
 
 `--vuln` sweeps the domain for the most common Kerberos/delegation abuse targets and prints them in a closing section:
@@ -286,7 +312,7 @@ Each `pKICertificateTemplate` is evaluated from LDAP alone: **ESC1** (enrollee s
 
 ESC4 and the ESC7 CA-object check are deliberately restricted to **low-privileged** trustees (Everyone / Authenticated Users / Domain Users / Domain Computers / Users). Admins and the CA's own host machine account hold these rights on the built-in templates *by default*, so flagging them would bury real findings in noise — a single-attribute `WriteProperty` is likewise not treated as ESC4. The trade-off: a delegation to a **custom** (non-low-priv) group won't show; run [Certipy](https://github.com/ly4k/Certipy) for exhaustive template-ACL analysis, and to confirm/exploit ESC6/ESC8/ESC11 (which depend on CA registry / HTTP / RPC state and aren't LDAP-observable).
 
-> The modules that parse security descriptors (`--acl`, `--adcs`, `--takeover`) need impacket; the rest are pure LDAP reads.
+> The modules that parse security descriptors (`--acl`, `--object-acls`, `--adcs`, `--takeover`) need impacket; the rest are pure LDAP reads.
 
 ## Save to file
 

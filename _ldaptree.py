@@ -136,6 +136,42 @@ def fetch_gpo_acls(conn, domain_ncs):
     return gpos
 
 
+def fetch_site_acls(conn, config_nc):
+    """Return a record per site object (CN=Sites,<config_nc>), each carrying its
+    raw SD.
+
+    Shaped like the GPO items (name/dn/_sd_raw) so enrich_acls() processes them
+    unchanged. Sites live in the Configuration NC, not under the domain head, so
+    they are invisible to the main OU-tree search — but a site can carry its own
+    gPLink, so write access to a site object (GenericAll/WriteDacl/Owner/
+    WriteGPLink) is exactly as much a takeover primitive as it is for an OU or a
+    GPO: link an attacker-controlled GPO to the site and it applies to every
+    computer AD considers part of it.
+    """
+    if not config_nc:
+        return []
+    sites = []
+    controls = security_descriptor_control(sdflags=0x05)  # DACL + Owner, no SACL
+    try:
+        conn.search(
+            search_base=f"CN=Sites,{config_nc}",
+            search_filter="(objectClass=site)",
+            search_scope=SUBTREE,
+            attributes=["nTSecurityDescriptor"],
+            controls=controls,
+        )
+    except LDAPException:
+        return sites
+    for e in conn.entries:
+        dn = str(e.entry_dn)
+        try:
+            sd = e["nTSecurityDescriptor"].raw_values[0]
+        except Exception:
+            sd = None
+        sites.append({"name": dn.split(",")[0][3:], "dn": dn, "_sd_raw": sd})
+    return sites
+
+
 def parse_gplinks(gplink_str, gpo_names):
     """Parse a gPLink attribute string into an ordered list of GPO-link dicts.
 
@@ -190,11 +226,37 @@ ACE_FULL_CONTROL      = 0x000F01FF  # all specific+standard rights set (== Gener
 
 ACE_INHERITED = 0x10  # AceFlags bit: this ACE was inherited from a parent
 
-# schemaIDGUIDs of attributes whose write is itself an attack primitive on an
-# OU. gPLink is the big one: writing it links an attacker-controlled GPO to the
-# OU and thus code-execs every computer/user beneath it.
+# schemaIDGUIDs of attributes (or validated-write control-access rights) whose
+# write is itself an attack primitive on whatever object carries them — not
+# OU-specific, also matched on the arbitrary objects --takeover scans. Values
+# are the canonical primitive name (matching BloodHound/SharpHound edge names,
+# not the raw schema attribute name) so the finding reads as an action, not a
+# schema lookup. Each GUID is confirmed against Microsoft's [MS-ADA2] docs.
 KNOWN_OBJECT_GUIDS = {
-    "f30e3bbe-9ff0-11d1-b603-0000f80367c1": "gPLink",
+    "f30e3bbe-9ff0-11d1-b603-0000f80367c1": "WriteGPLink",         # link an attacker GPO to an OU
+    "f3a64788-5306-11d1-a9c5-0000f80367c1": "WriteSPN",            # add an SPN → targeted Kerberoasting
+    "5b47d60f-6090-40b2-9f37-2a4de88f3063": "AddKeyCredentialLink", # Shadow Credentials (PKINIT as target)
+    "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "AddAllowedToAct",     # sets up RBCD
+    "bf9679c0-0de6-11d0-a285-00aa003049e2": "AddMember",           # add a principal to a group
+    "4c164200-20c0-11d0-a768-00aa006e0529": "WriteAccountRestrictions",  # property set incl. msDS-AllowedToActOnBehalfOfOtherIdentity — a 2nd path to RBCD
+}
+
+# The Member attribute's schemaIDGUID above doubles as the rightsGUID for the
+# separate "Self-Membership" validated write — a real AD quirk, not a typo.
+# Unlike every other entry in KNOWN_OBJECT_GUIDS, the two bits are NOT the same
+# primitive here: Self scoped to this GUID is DC-enforced to add/remove only
+# the trustee itself, while WriteProperty scoped to the same GUID allows
+# writing arbitrary members. Collapsing Self here to "AddMember" (like the
+# WriteSPN/AddKeyCredentialLink cases legitimately do) would overstate a
+# self-only grant, so it gets its own label instead.
+MEMBER_ATTRIBUTE_GUID = "bf9679c0-0de6-11d0-a285-00aa003049e2"
+
+# Control-access-right GUIDs (granted via the ACE_DS_CONTROL_ACCESS bit,
+# object-scoped to one specific extended right) whose grant is itself a
+# takeover primitive — distinct from KNOWN_OBJECT_GUIDS, which is attribute
+# writes gated by the WRITE_PROP/SELF bits instead.
+KNOWN_CONTROL_ACCESS_GUIDS = {
+    "00299570-246d-11d0-a768-00aa006e0529": "ForceChangePassword",  # reset the target's password, no old-password needed
 }
 
 # schemaIDGUID of the groupPolicyContainer class — the child-object type in a
@@ -203,6 +265,8 @@ GROUP_POLICY_CONTAINER_CLASS_GUID = "f30e3bc2-9ff0-11d1-b603-0000f80367c1"
 
 # Control-access-right GUIDs whose combination on the domain head grants DCSync
 # (replicate + replicate secrets → dump every password hash, incl. krbtgt).
+# Kept separate from KNOWN_CONTROL_ACCESS_GUIDS: DCSync needs BOTH rights
+# present together (see dcsync_from_sd), not a simple single-GUID→label map.
 DS_REPL_GET_CHANGES     = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
 DS_REPL_GET_CHANGES_ALL = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
 
@@ -241,6 +305,8 @@ DEFAULT_PRIVILEGED_RIDS = {
     520,  # Group Policy Creator Owners (default full control over GPOs it creates)
     521,  # Read-only Domain Controllers
     498,  # Enterprise Read-only Domain Controllers
+    526,  # Key Admins (default, inherited AddKeyCredentialLink on every descendant object)
+    527,  # Enterprise Key Admins (same, forest-wide — root domain's RID, seen via inheritance in child domains too)
 }
 
 # "Unsafe" principals a normal attacker is a member of or can leverage. A
@@ -285,13 +351,16 @@ def is_default_privileged(sid):
     return rid.isdigit() and int(rid) in DEFAULT_PRIVILEGED_RIDS
 
 
-def interpret_access_mask(mask, obj_guid, obj_label):
+def interpret_access_mask(mask, obj_guid):
     """Return the list of *dangerous* right labels present in an access mask.
 
-    obj_guid/obj_label describe an object-scoped ACE's target attribute or
-    extended right (None for ACEs that cover the whole object). Property/
-    extended-right writes are only reported when unscoped (all attributes) or
-    scoped to a known-dangerous attribute — a delegated write to one benign
+    obj_guid identifies an object-scoped ACE's target attribute or extended
+    right (None for ACEs that cover the whole object). Property/extended-right
+    writes are only reported when unscoped (WriteProperty(All)/AddSelf/
+    AllExtendedRights) or scoped to a known-dangerous attribute
+    (KNOWN_OBJECT_GUIDS) or extended right (KNOWN_CONTROL_ACCESS_GUIDS),
+    reported under its canonical primitive name (e.g. "WriteSPN",
+    "ForceChangePassword") — a delegated write/right scoped to one benign
     attribute is not flagged.
     """
     if mask & ACE_GENERIC_ALL or (mask & ACE_FULL_CONTROL) == ACE_FULL_CONTROL:
@@ -308,10 +377,32 @@ def interpret_access_mask(mask, obj_guid, obj_label):
         if obj_guid is None:
             rights.append("WriteProperty(All)")
         elif obj_guid in KNOWN_OBJECT_GUIDS:
-            rights.append(f"WriteProperty({obj_label})")
+            rights.append(KNOWN_OBJECT_GUIDS[obj_guid])
         # scoped to a benign single attribute → not a takeover primitive, skip
-    if mask & ACE_DS_CONTROL_ACCESS and obj_guid is None:
-        rights.append("AllExtendedRights")
+    if mask & ACE_DS_SELF:
+        if obj_guid is None or obj_guid == MEMBER_ATTRIBUTE_GUID:
+            # Unscoped Self, or Self-Membership (see MEMBER_ATTRIBUTE_GUID):
+            # both mean "add/remove only yourself", never arbitrary members.
+            if "AddSelf" not in rights:
+                rights.append("AddSelf")
+        elif obj_guid in KNOWN_OBJECT_GUIDS:
+            # "Validated write" encoding (e.g. WriteSPN granted via the ADUC
+            # delegation wizard) — same primitive as the WriteProperty case
+            # above, just a different mask bit (ADS_RIGHT_DS_SELF instead of
+            # _WRITE_PROP). Collapsing both to the same label is deliberate:
+            # the exploitation is identical either way, so which bit AD
+            # happened to use is noise. Dedup: a single ACE can set both bits.
+            name = KNOWN_OBJECT_GUIDS[obj_guid]
+            if name not in rights:
+                rights.append(name)
+    if mask & ACE_DS_CONTROL_ACCESS:
+        if obj_guid is None:
+            rights.append("AllExtendedRights")
+        elif obj_guid in KNOWN_CONTROL_ACCESS_GUIDS:
+            name = KNOWN_CONTROL_ACCESS_GUIDS[obj_guid]
+            if name not in rights:
+                rights.append(name)
+        # scoped to an unrecognized extended right → not a takeover primitive, skip
     return rights
 
 
@@ -347,10 +438,8 @@ def analyze_sd(sd_bytes):
         if ace["AceType"] == ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE:
             if body["Flags"] & ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT:
                 obj_guid = bin_to_string(body["ObjectType"]).lower()
-        obj_label = KNOWN_OBJECT_GUIDS.get(obj_guid,
-                                           obj_guid[:8] if obj_guid else None)
 
-        rights = interpret_access_mask(body["Mask"]["Mask"], obj_guid, obj_label)
+        rights = interpret_access_mask(body["Mask"]["Mask"], obj_guid)
         if not rights:
             continue
         results.append((sid, rights, bool(ace["AceFlags"] & ACE_INHERITED)))
@@ -393,10 +482,8 @@ def self_rights_from_sd(sd_bytes, my_sids):
             if ace["AceType"] == ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE:
                 if body["Flags"] & ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT:
                     obj_guid = bin_to_string(body["ObjectType"]).lower()
-            obj_label = KNOWN_OBJECT_GUIDS.get(obj_guid,
-                                               obj_guid[:8] if obj_guid else None)
 
-            rights = interpret_access_mask(body["Mask"]["Mask"], obj_guid, obj_label)
+            rights = interpret_access_mask(body["Mask"]["Mask"], obj_guid)
             if not rights:
                 continue
             results.append((sid, rights, bool(ace["AceFlags"] & ACE_INHERITED)))
@@ -424,13 +511,48 @@ def resolve_sid(conn, sid, search_base, cache):
     return name
 
 
+def _aggregate_trustee_aces(conn, owner_sid, aces, search_base, cache):
+    """Turn (owner_sid, [(sid, rights, inherited)]) into a rendered acl list.
+
+    The owner is surfaced first (only if non-default — an owner holds implicit
+    WriteDacl), then each trustee's ACEs are aggregated: a principal that appears
+    in several ACEs (e.g. object-scoped CreateChild for user/group/computer as
+    separate ACEs) is shown once with the union of its rights, marked
+    (inherited) only if *every* one of its dangerous ACEs is inherited. Shared
+    by enrich_acls() (OU/GPO/Site items) and fetch_object_acls() (arbitrary
+    user/computer/group objects) — same aggregation, different object source.
+    """
+    acl = []
+    if owner_sid and not is_default_privileged(owner_sid):
+        acl.append({
+            "who":       resolve_sid(conn, owner_sid, search_base, cache),
+            "rights":    ["Owner"],
+            "inherited": False,
+        })
+
+    agg   = {}   # sid -> {"rights": [...], "inherited": bool}
+    order = []   # preserve first-seen order
+    for sid, rights, inherited in aces:
+        if sid not in agg:
+            agg[sid] = {"rights": [], "inherited": True}
+            order.append(sid)
+        for r in rights:
+            if r not in agg[sid]["rights"]:
+                agg[sid]["rights"].append(r)
+        agg[sid]["inherited"] &= inherited
+    for sid in order:
+        acl.append({
+            "who":       resolve_sid(conn, sid, search_base, cache),
+            "rights":    agg[sid]["rights"],
+            "inherited": agg[sid]["inherited"],
+        })
+    return acl
+
+
 def enrich_acls(conn, ou_data, search_base):
     """Attach an "acl" list of interesting-ACE dicts to each OU item.
 
-    ACEs are aggregated per trustee: a principal that appears in several ACEs
-    (e.g. object-scoped CreateChild for user/group/computer as separate ACEs) is
-    shown once with the union of its rights. A trustee is marked (inherited) only
-    if *every* one of its dangerous ACEs is inherited.
+    See _aggregate_trustee_aces() for the aggregation rules.
     """
     cache = {}
     for item in ou_data:
@@ -442,30 +564,7 @@ def enrich_acls(conn, ou_data, search_base):
             owner_sid, aces = analyze_sd(raw)
         except Exception:
             continue
-
-        if owner_sid and not is_default_privileged(owner_sid):
-            item["acl"].append({
-                "who":       resolve_sid(conn, owner_sid, search_base, cache),
-                "rights":    ["Owner"],
-                "inherited": False,
-            })
-
-        agg   = {}   # sid -> {"rights": [...], "inherited": bool}
-        order = []   # preserve first-seen order
-        for sid, rights, inherited in aces:
-            if sid not in agg:
-                agg[sid] = {"rights": [], "inherited": True}
-                order.append(sid)
-            for r in rights:
-                if r not in agg[sid]["rights"]:
-                    agg[sid]["rights"].append(r)
-            agg[sid]["inherited"] &= inherited
-        for sid in order:
-            item["acl"].append({
-                "who":       resolve_sid(conn, sid, search_base, cache),
-                "rights":    agg[sid]["rights"],
-                "inherited": agg[sid]["inherited"],
-            })
+        item["acl"] = _aggregate_trustee_aces(conn, owner_sid, aces, search_base, cache)
 
 
 # --- "what can I take over" (--takeover) -----------------------------------
@@ -660,6 +759,54 @@ def fetch_takeover(conn, scan_bases, my_sids, cache):
                 "via":       via,
                 "inherited": inherited,
                 "owner":     bool(owner_mine),
+                "nc":        base,  # which naming context this was found under (see _host_node)
+            })
+        out.append(d)
+    return out
+
+
+# person/computer/group/gMSA — the security-principal classes carrying an
+# objectSid, i.e. the ones a takeover-grade ACE actually matters on. Contacts
+# etc. are excluded (no objectSid, not a usable trustee or target).
+OBJECT_ACL_FILTER = ("(|(objectCategory=person)(objectCategory=computer)"
+                      "(objectCategory=group)(objectCategory=msDS-GroupManagedServiceAccount))")
+
+
+def fetch_object_acls(conn, domain_ncs, cache):
+    """Per-domain list of user/computer/group(/gMSA) objects carrying non-default,
+    takeover-grade ACEs held by ANY principal — not just the caller.
+
+    Neither --acl (OUs/GPOs/Sites only) nor --takeover (self only) can surface a
+    plain delegation between two arbitrary accounts, e.g. one low-priv user
+    holding AddKeyCredentialLink on another — this is exactly that view. Pages
+    every object per domain NC (like fetch_takeover, but scoped to the domain
+    NCs, since principals never live in Configuration/Schema/*DnsZones) and
+    reuses analyze_sd() + _aggregate_trustee_aces(), the same non-default-trustee
+    filter and per-trustee aggregation used for OUs/GPOs/Sites.
+    """
+    controls = security_descriptor_control(sdflags=0x05)  # DACL + Owner, no SACL
+    out = []
+    for nc in domain_ncs:
+        d = {"domain": _base_label(nc), "objects": []}
+        for e in _paged_search(
+                conn, nc, OBJECT_ACL_FILTER,
+                ["nTSecurityDescriptor", "sAMAccountName", "objectClass", "name"],
+                controls=controls):
+            raw = _attr_raw(e, "nTSecurityDescriptor")
+            if not raw:
+                continue
+            try:
+                owner_sid, aces = analyze_sd(raw)
+            except Exception:
+                continue
+            acl = _aggregate_trustee_aces(conn, owner_sid, aces, nc, cache)
+            if not acl:
+                continue
+            d["objects"].append({
+                "dn":   str(e.entry_dn),
+                "name": _obj_name(e),
+                "kind": _obj_kind(e),
+                "acl":  acl,
             })
         out.append(d)
     return out
@@ -926,7 +1073,7 @@ def _rbcd_principals(sd_bytes):
 
 def fetch_vuln(conn, domain_ncs, cache):
     """Per-domain attack surface: kerberoastable / AS-REP-roastable users,
-    non-DC unconstrained & constrained delegation, and RBCD.
+    non-DC unconstrained & constrained delegation, RBCD, and SID History.
     """
     bitand   = LDAP_MATCHING_RULE_BIT_AND
     disabled = f"(userAccountControl:{bitand}:={UAC_ACCOUNTDISABLE})"
@@ -936,8 +1083,8 @@ def fetch_vuln(conn, domain_ncs, cache):
     for nc in domain_ncs:
         d = {"domain": domain_from_base_dn(nc), "kerberoastable": [], "asrep": [],
              "unconstrained": [], "constrained": [], "rbcd": [],
-             "secrets": [], "passwd_notreqd": [], "reversible": [], "admincount": set(),
-             "objects": {}}
+             "secrets": [], "passwd_notreqd": [], "reversible": [], "sidhistory": [],
+             "admincount": set(), "objects": {}}
 
         def _search(flt, attrs):
             try:
@@ -1050,6 +1197,28 @@ def fetch_vuln(conn, domain_ncs, cache):
             d["reversible"].append(str(e["sAMAccountName"].value))
             _add(e, "reversible-encryption", "user")
 
+        # SID History — leftover privilege from an inter-domain object migration
+        # (e.g. ADMT); each raw value is an extra SID the account's token carries.
+        # Not sAMAccountType-restricted: groups and computers can carry it too.
+        for e in _search("(sIDHistory=*)",
+                         ["sAMAccountName", "sIDHistory", "objectClass"]):
+            try:
+                raws = e["sIDHistory"].raw_values
+            except Exception:
+                raws = []
+            if not raws:
+                continue
+            sids = []
+            if HAS_IMPACKET:
+                for raw in raws:
+                    try:
+                        sids.append(resolve_sid(conn, LDAP_SID(data=raw).formatCanonical(), nc, cache))
+                    except Exception:
+                        pass
+            name = _attr_str(e, "sAMAccountName") or str(e.entry_dn).split(",", 1)[0]
+            d["sidhistory"].append((name, _obj_kind(e), len(raws), sids))
+            _add(e, f"SIDHistory({len(raws)})", _obj_kind(e))
+
         # Star objects that are also adminCount=1 (privileged)
         for o in d["objects"].values():
             o["admin"] = o["name"] in d["admincount"]
@@ -1072,6 +1241,8 @@ PRIV_GROUPS = [
     ("Cert Publishers",             "rid",  517),
     ("Group Policy Creator Owners", "rid",  520),
     ("Protected Users",             "rid",  525),
+    ("Key Admins",                  "rid",  526),  # can AddKeyCredentialLink on any user/computer — Shadow Credentials on demand
+    ("Enterprise Key Admins",       "rid",  527),  # same, forest-wide
     ("DnsAdmins",                   "name", "DnsAdmins"),      # DLL load → RCE on the DC
 ]
 
@@ -1316,22 +1487,37 @@ CT_ENROLLEE_SUPPLIES_SUBJECT = 0x00000001   # name flag  → requester picks the
 CT_PEND_ALL_REQUESTS         = 0x00000002   # enroll flag → CA-manager approval required
 CT_NO_SECURITY_EXTENSION     = 0x00080000   # enroll flag → no SID security ext (ESC9)
 
+# schemaIDGUIDs of the two template flag attributes. A scoped WriteProperty on
+# either one lets a principal flip exactly the bits ESC1/ESC9 check
+# (CT_ENROLLEE_SUPPLIES_SUBJECT / CT_PEND_ALL_REQUESTS / CT_NO_SECURITY_EXTENSION)
+# without needing full control of the template — same practical outcome as
+# ESC4's object-wide writers, just a narrower primitive (BloodHound's
+# WritePKINameFlag / WritePKIEnrollmentFlag edges).
+FLAG_ATTRIBUTE_GUIDS = {
+    "ea1dddc4-60ff-416e-8cc0-17cee534bce7": "WritePKINameFlag",       # msPKI-Certificate-Name-Flag
+    "d15ef7d8-f226-46db-ae79-b34e560bd12c": "WritePKIEnrollmentFlag", # msPKI-Enrollment-Flag
+}
+
 
 def template_sd_rights(sd_bytes):
-    """(enroller_sids, writer_sids) — non-default principals that can enroll in,
-    or take object-wide control of, a certificate template (or CA object).
+    """(enroller_sids, writer_sids, flag_writer_pairs) — non-default principals
+    that can enroll in, take object-wide control of, or flip a specific flag
+    attribute on a certificate template (or CA object).
 
     "writers" means GenericAll/GenericWrite/WriteDacl/WriteOwner — the rights that
-    let you reconfigure the template into ESC1. A WriteProperty scoped to a single
-    attribute is NOT ESC4 and is deliberately excluded (it is what made default
-    templates show up as false positives)."""
-    enrollers, writers = [], []
+    let you reconfigure the template into ESC1. "flag_writer_pairs" is
+    (sid, "WritePKINameFlag"/"WritePKIEnrollmentFlag") for a narrower scoped write
+    that achieves the same thing without full control; SIDs already counted in
+    "writers" are excluded from it to avoid double-reporting. A WriteProperty
+    scoped to any OTHER single attribute is neither and is deliberately excluded
+    (it is what made default templates show up as false positives)."""
+    enrollers, writers, flag_writers = [], [], []
     try:
         dacl = SR_SECURITY_DESCRIPTOR(data=sd_bytes)["Dacl"]
     except Exception:
-        return enrollers, writers
+        return enrollers, writers, flag_writers
     if not dacl:
-        return enrollers, writers
+        return enrollers, writers, flag_writers
     write_bits = (ACE_WRITE_DACL | ACE_WRITE_OWNER | ACE_GENERIC_WRITE)
     for ace in dacl["Data"]:
         if ace["AceType"] not in (ACCESS_ALLOWED_ACE.ACE_TYPE,
@@ -1345,6 +1531,14 @@ def template_sd_rights(sd_bytes):
         full = bool(mask & ACE_GENERIC_ALL) or (mask & ACE_FULL_CONTROL) == ACE_FULL_CONTROL
         if (full or (mask & write_bits)) and sid not in writers:
             writers.append(sid)
+        if not full and mask & ACE_DS_WRITE_PROP and \
+           ace["AceType"] == ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE and \
+           (body["Flags"] & ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT):
+            obj = bin_to_string(body["ObjectType"]).lower()
+            if obj in FLAG_ATTRIBUTE_GUIDS:
+                pair = (sid, FLAG_ATTRIBUTE_GUIDS[obj])
+                if pair not in flag_writers:
+                    flag_writers.append(pair)
         enroll = full
         if mask & ACE_DS_CONTROL_ACCESS:
             obj = None
@@ -1355,14 +1549,17 @@ def template_sd_rights(sd_bytes):
                 enroll = True
         if enroll and sid not in enrollers:
             enrollers.append(sid)
-    return enrollers, writers
+    flag_writers = [(sid, label) for sid, label in flag_writers if sid not in writers]
+    return enrollers, writers, flag_writers
 
 
 def _evaluate_template(name_flag, enroll_flag, ra_sigs, ekus, enrollers, low_writers):
     """Return the list of ESC labels a template qualifies for. `enrollers` are
     non-default principals that can enroll; `low_writers` are LOW-PRIVILEGED
-    principals with object-wide write (already filtered — an admin writer is the
-    expected default and is not ESC4)."""
+    principals able to reconfigure the template into ESC1 (already filtered —
+    an admin writer is the expected default and is not ESC4) — this includes
+    both object-wide writers and narrower WritePKIEnrollmentFlag/
+    WritePKINameFlag holders, since either is enough to flip the same bits."""
     supplies_subject = bool(name_flag & CT_ENROLLEE_SUPPLIES_SUBJECT)
     manager_approval = bool(enroll_flag & CT_PEND_ALL_REQUESTS)
     no_sec_ext       = bool(enroll_flag & CT_NO_SECURITY_EXTENSION)
@@ -1408,7 +1605,7 @@ def fetch_adcs(conn, config_nc, resolve_base, cache):
             except Exception:
                 pass
             published.update(t.lower() for t in templates)
-            _, writers = template_sd_rights(_attr_raw(e, "nTSecurityDescriptor") or b"")
+            _, writers, _ = template_sd_rights(_attr_raw(e, "nTSecurityDescriptor") or b"")
             low_writers = [w for w in writers if is_low_priv(w)]  # ESC7: skip the CA's own host / admins
             result["cas"].append({
                 "name":      _attr_str(e, "cn") or str(e.entry_dn),
@@ -1438,20 +1635,25 @@ def fetch_adcs(conn, config_nc, resolve_base, cache):
                 ekus = [str(o) for o in e["pKIExtendedKeyUsage"].values]
             except Exception:
                 ekus = []
-            enrollers, writers = template_sd_rights(_attr_raw(e, "nTSecurityDescriptor") or b"")
+            enrollers, writers, flag_writers = template_sd_rights(
+                _attr_raw(e, "nTSecurityDescriptor") or b"")
             low_writers = [w for w in writers if is_low_priv(w)]  # ESC4 only for low-priv writers
+            low_flag_writers = [(s, lbl) for s, lbl in flag_writers if is_low_priv(s)]
             escs = _evaluate_template(_int("msPKI-Certificate-Name-Flag"),
                                       _int("msPKI-Enrollment-Flag"),
                                       _int("msPKI-RA-Signature"),
-                                      ekus, enrollers, low_writers)
+                                      ekus, enrollers,
+                                      low_writers + [s for s, _ in low_flag_writers])
             if not escs:
                 continue
             result["templates"].append({
-                "name":      _attr_str(e, "displayName") or cn,
-                "enabled":   cn.lower() in published,
-                "escs":      escs,
-                "enrollers": [resolve_sid(conn, s, resolve_base, cache) for s in enrollers],
-                "writers":   [resolve_sid(conn, s, resolve_base, cache) for s in low_writers],
+                "name":         _attr_str(e, "displayName") or cn,
+                "enabled":      cn.lower() in published,
+                "escs":         escs,
+                "enrollers":    [resolve_sid(conn, s, resolve_base, cache) for s in enrollers],
+                "writers":      [resolve_sid(conn, s, resolve_base, cache) for s in low_writers],
+                "flag_writers": [f"{resolve_sid(conn, s, resolve_base, cache)} ({lbl})"
+                                  for s, lbl in low_flag_writers],
             })
     except LDAPException:
         pass
@@ -1633,14 +1835,28 @@ def print_ou(item, depth, extra_indent, out):
     _print_takeover_objects(item, indent + "    ", out)
 
 
-def _host_node(obj_dn, index):
-    """Nearest ancestor node (OU/container/domain/root) present in `index`."""
+def _host_node(obj_dn, index, nc_head=None):
+    """Nearest ancestor node (OU/container/domain/root) present in `index`,
+    without climbing past the object's own naming-context head.
+
+    DomainDnsZones/ForestDnsZones/Configuration/Schema DNs (e.g.
+    DC=DomainDnsZones,DC=inlanefreight,DC=local) happen to textually END with
+    the domain's own DN, even though they're separate partitions, not real
+    descendants of it. Without a boundary, climbing keeps going past that
+    partition's head and lands on the domain root — misattaching e.g. a DNS
+    zone object under the domain node in the main tree. nc_head is the naming
+    context the object was actually found under (see fetch_takeover); once the
+    climb reaches it without a match, stop instead of crossing into whatever
+    partition happens to share that DN suffix.
+    """
     dn = obj_dn
     while "," in dn:
         dn = dn.split(",", 1)[1]           # climb to parent, then keep climbing
         node = index.get(dn.lower())
         if node is not None:
             return node
+        if nc_head and dn.lower() == nc_head.lower():
+            return None
     return None
 
 
@@ -1676,7 +1892,7 @@ def attach_takeover_objects(ou_data, root_item, domains, takeover_info):
         node.setdefault("takeover_objects", [])
     for d in takeover_info:
         for o in d.get("objects", []):
-            host = _host_node(o["dn"], index)
+            host = _host_node(o["dn"], index, nc_head=o.get("nc"))
             if host is not None:
                 host["takeover_objects"].append(o)
 
@@ -1737,6 +1953,50 @@ def print_gpo_acls(gpo_items, out=None):
             rights = ", ".join(ace["rights"])
             inh    = f" {GREY}(inherited){NC}{RED}" if ace["inherited"] else ""
             print(f"    {RED}! {rights} → {ace['who']}{inh}{NC}", file=out)
+
+
+def print_site_acls(site_items, out=None):
+    """Print the Sites (Configuration NC) that carry non-default/abusable rights."""
+    out = out or sys.stdout
+    flagged = sorted((s for s in site_items if s.get("acl")),
+                     key=lambda x: x["name"].lower())
+    print("", file=out)
+    print("Sites (Configuration NC) — non-default rights", file=out)
+    print(f"Sites: {len(site_items)}  Flagged: {len(flagged)}", file=out)
+    print("=" * 60, file=out)
+    if not flagged:
+        print("No non-default rights found on site objects.", file=out)
+        return
+    for s in flagged:
+        print(f"{s['name']} {GREY}[{s['dn']}]{NC}", file=out)
+        for ace in s["acl"]:
+            rights = ", ".join(ace["rights"])
+            inh    = f" {GREY}(inherited){NC}{RED}" if ace["inherited"] else ""
+            print(f"    {RED}! {rights} → {ace['who']}{inh}{NC}", file=out)
+
+
+def print_object_acls(object_acl_info, out=None):
+    """Print user/computer/group(/gMSA) objects carrying non-default,
+    takeover-grade ACEs held by ANY principal (arbitrary delegations between
+    other accounts — see fetch_object_acls)."""
+    out = out or sys.stdout
+    print("", file=out)
+    print("Object ACLs — non-default rights on users/computers/groups", file=out)
+    print("=" * 60, file=out)
+    total = sum(len(d["objects"]) for d in object_acl_info)
+    if not total:
+        print("No non-default rights found on user/computer/group objects.", file=out)
+        return
+    for d in object_acl_info:
+        if not d["objects"]:
+            continue
+        print(d["domain"], file=out)
+        for o in sorted(d["objects"], key=lambda x: x["name"].lower()):
+            print(f"  {o['name']} {GREY}({o['kind']}) [{o['dn']}]{NC}", file=out)
+            for ace in o["acl"]:
+                rights = ", ".join(ace["rights"])
+                inh    = f" {GREY}(inherited){NC}{RED}" if ace["inherited"] else ""
+                print(f"    {RED}! {rights} → {ace['who']}{inh}{NC}", file=out)
 
 
 def print_gpo_creators(creator_info, out=None):
@@ -1820,7 +2080,7 @@ def print_vuln(vuln_info, out=None):
     def _sections(d):
         return (d["kerberoastable"] or d["asrep"] or d["unconstrained"] or
                 d["constrained"] or d["rbcd"] or d["secrets"] or
-                d["passwd_notreqd"] or d["reversible"])
+                d["passwd_notreqd"] or d["reversible"] or d["sidhistory"])
 
     if not any(_sections(d) for d in vuln_info):
         print("None found.", file=out)
@@ -1879,6 +2139,12 @@ def print_vuln(vuln_info, out=None):
             print(f"  {GREY}Reversible encryption (password recoverable):{NC}", file=out)
             for sam in d["reversible"]:
                 print(f"    {YELLOW}◆ {sam}{NC}{_star(sam)}", file=out)
+
+        if d["sidhistory"]:
+            print(f"  {GREY}SID History (leftover privilege from a migration):{NC}", file=out)
+            for name, kind, n, sids in d["sidhistory"]:
+                extra = f": {', '.join(sids)}" if sids else " (install impacket to resolve)"
+                print(f"    {RED}! {name} {GREY}({kind}, {n} SID(s)){NC}{extra}", file=out)
 
 
 def print_priv_groups(group_info, out=None):
@@ -2025,6 +2291,8 @@ def print_adcs(adcs, out=None):
             print(f"    {GREY}enrollable by: {', '.join(t['enrollers'])}{NC}", file=out)
         if t.get("writers"):
             print(f"    {GREY}writable by: {', '.join(t['writers'])}{NC}", file=out)
+        if t.get("flag_writers"):
+            print(f"    {GREY}flag-writable by: {', '.join(t['flag_writers'])}{NC}", file=out)
     print(f"{GREY}(ESC6/ESC8/ESC11 need CA registry / HTTP / RPC access — not checked over LDAP){NC}",
           file=out)
 
@@ -2045,7 +2313,8 @@ def main():
     parser.add_argument("-v", "--verbose",  action="store_true",             help="Verbose logging")
     parser.add_argument("--gc",             action="store_true",             help="Query the Global Catalog (port 3269/3268) for forest-wide enumeration")
     parser.add_argument("--containers",     action="store_true",             help="Include well-known containers (CN=Users, CN=Computers, etc.) in the tree")
-    parser.add_argument("--acl",            action="store_true",             help="Flag non-default/abusable rights: ACEs on each OU and GPO object, who can create GPOs, and who can DCSync the domain. Requires impacket")
+    parser.add_argument("--acl",            action="store_true",             help="Flag non-default/abusable rights: ACEs on each OU, GPO, and Site object, who can create GPOs, and who can DCSync the domain. Requires impacket")
+    parser.add_argument("--object-acls",    action="store_true",             help="Scan every user/computer/group(/gMSA) object for non-default, takeover-grade ACEs held by ANY principal (not just you) — e.g. a WriteSPN/AddKeyCredentialLink/ForceChangePassword delegation between two arbitrary accounts. Pages the full domain; can be slow on large domains. Requires impacket")
     parser.add_argument("--vuln",           action="store_true",             help="Enumerate attack surface: kerberoastable & AS-REP-roastable users, delegation, RBCD, weak account flags, and secrets in description fields")
     parser.add_argument("--groups",         action="store_true",             help="Dump transitive membership of privileged groups (Domain/Enterprise Admins, operators, DnsAdmins, ...)")
     parser.add_argument("--creds",          action="store_true",             help="Show LAPS local-admin passwords and gMSA managed passwords readable by the current user")
@@ -2053,7 +2322,7 @@ def main():
     parser.add_argument("--computers",      action="store_true",             help="List computer accounts with OS, flagging end-of-life OSes and stale accounts")
     parser.add_argument("--adcs",           action="store_true",             help="Enumerate AD CS CAs and certificate templates, flagging ESC1/2/3/4/9 misconfigurations. Requires impacket")
     parser.add_argument("--takeover",       action="store_true",             help="Scan every object's ACL and show (in purple) the objects the current user can take over — takeover-grade rights held by you, your groups, or Everyone/Authenticated Users. Requires impacket")
-    parser.add_argument("-A", "--all",      action="store_true",             help="Enable every enumeration module (--acl --vuln --groups --creds --trusts --computers --adcs --takeover)")
+    parser.add_argument("-A", "--all",      action="store_true",             help="Enable every enumeration module (--acl --object-acls --vuln --groups --creds --trusts --computers --adcs --takeover)")
     parser.add_argument("--no-ldaps",       action="store_true",             help="Use plain LDAP (port 389/3268) instead of LDAPS")
     parser.add_argument("--version",        action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
@@ -2068,11 +2337,11 @@ def main():
         args.hash = nt  # normalised to 'LM:NT' for ldap3 pass-the-hash
 
     if args.all:
-        args.acl = args.vuln = args.groups = args.creds = True
+        args.acl = args.object_acls = args.vuln = args.groups = args.creds = True
         args.trusts = args.computers = args.adcs = args.takeover = True
 
-    if (args.acl or args.adcs or args.takeover) and not HAS_IMPACKET:
-        log_error("--acl/--adcs/--takeover require impacket. Install it with: pip install impacket")
+    if (args.acl or args.object_acls or args.adcs or args.takeover) and not HAS_IMPACKET:
+        log_error("--acl/--object-acls/--adcs/--takeover require impacket. Install it with: pip install impacket")
         sys.exit(1)
 
     if args.verbose:
@@ -2223,7 +2492,14 @@ def main():
     for item in ou_data:
         item["gplinks"] = parse_gplinks(item.pop("_gplink_raw", ""), gpo_names)
 
+    # Shared by --acl (Sites live here too) and --adcs (CAs/templates live here).
+    config_nc = rootdse.get("configurationNamingContext") or (
+        "CN=Configuration," + rootdse["rootDomainNamingContext"]
+        if rootdse.get("rootDomainNamingContext") else "")
+
     gpo_items = []
+    site_items = []
+    object_acl_info = []
     gpo_creators = []
     dcsync_info = []
     vuln_info = []
@@ -2253,6 +2529,14 @@ def main():
                     f"{sum(1 for g in gpo_items if g.get('acl'))} of {len(gpo_items)} GPOs",
                     args.verbose)
 
+        log_verbose(f"Analyzing site security descriptors under {config_nc or '(unknown config NC)'}",
+                    args.verbose)
+        site_items = fetch_site_acls(conn, config_nc)
+        enrich_acls(conn, site_items, acl_base)
+        log_verbose(f"Flagged non-default rights on "
+                    f"{sum(1 for s in site_items if s.get('acl'))} of {len(site_items)} site(s)",
+                    args.verbose)
+
         log_verbose("Enumerating non-default GPO-creation rights", args.verbose)
         gpo_creators = fetch_gpo_creators(conn, naming_contexts, {})
         log_verbose(f"Found non-default GPO creators in "
@@ -2263,6 +2547,13 @@ def main():
         dcsync_info = fetch_dcsync_rights(conn, naming_contexts, {})
         log_verbose(f"Found non-default replication rights in "
                     f"{sum(1 for d in dcsync_info if d['principals'])} domain(s)", args.verbose)
+
+    if args.object_acls:
+        log_verbose("Scanning every user/computer/group object for non-default ACEs "
+                    "(this pages the full domain and can take a while)", args.verbose)
+        object_acl_info = fetch_object_acls(conn, naming_contexts, {})
+        log_verbose(f"Flagged non-default rights on "
+                    f"{sum(len(d['objects']) for d in object_acl_info)} object(s)", args.verbose)
 
     if args.vuln:
         log_verbose("Enumerating kerberoast/AS-REP/delegation attack surface", args.verbose)
@@ -2286,9 +2577,6 @@ def main():
         comp_info = fetch_computers(conn, naming_contexts)
 
     if args.adcs:
-        config_nc = rootdse.get("configurationNamingContext") or (
-            "CN=Configuration," + rootdse["rootDomainNamingContext"]
-            if rootdse.get("rootDomainNamingContext") else "")
         adcs_base = rootdse.get("defaultNamingContext") or args.base_dn or (
             naming_contexts[0] if naming_contexts else "")
         log_verbose(f"Enumerating AD CS under {config_nc or '(unknown config NC)'}", args.verbose)
@@ -2386,8 +2674,11 @@ def main():
             print_takeover(takeover_info, my_name, out=out)
         if args.acl:
             print_gpo_acls(gpo_items, out=out)
+            print_site_acls(site_items, out=out)
             print_gpo_creators(gpo_creators, out=out)
             print_dcsync(dcsync_info, out=out)
+        if args.object_acls:
+            print_object_acls(object_acl_info, out=out)
         if args.vuln:
             print_vuln(vuln_info, out=out)
         if args.groups:
