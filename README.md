@@ -133,13 +133,13 @@ ldaptree.py -s $AD_DC_FQDN -u $AD_USER_SAMACCOUNTNAME -p $AD_USER_PASS --acl
 ```
   +-- Crownlands [OU=Crownlands,DC=sevenkingdoms,DC=local] [💻 0 👤 10 👥 4]
       ! GenericAll → helpdesk
-      ! WriteProperty(gPLink) → jon.snow
+      ! WriteGPLink → jon.snow
       ! WriteOwner → backup-svc (inherited)
 ```
 
-Rights surfaced: `Owner` (non-default), `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner`, `CreateChild`, `DeleteChild`, `DeleteTree`, `Delete`, `WriteProperty(All)`, `AllExtendedRights`, and — most importantly — **`WriteProperty(gPLink)`**, which lets the trustee link an attacker-controlled GPO to the OU and thus run code on every computer/user under it. Inherited ACEs are marked `(inherited)`.
+Rights surfaced: `Owner` (non-default), `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner`, `CreateChild`, `DeleteChild`, `DeleteTree`, `Delete`, `WriteProperty(All)`, `AddSelf`, `AllExtendedRights`, and a set of attack-relevant attribute/extended-right writes reported under their canonical BloodHound/SharpHound edge name rather than the raw schema attribute — **`WriteGPLink`** (link an attacker GPO to the OU), **`WriteSPN`** (targeted Kerberoasting), **`AddKeyCredentialLink`** (Shadow Credentials), **`AddAllowedToAct`** / **`WriteAccountRestrictions`** (RBCD), **`AddMember`** (add a principal to a group), and **`ForceChangePassword`**. Inherited ACEs are marked `(inherited)`.
 
-To keep the output to genuine delegations, ACEs held by built-in principals that hold rights on every OU **by default** are not shown — both Tier-0 admins (SYSTEM, Administrators, Domain/Enterprise Admins, Domain Controllers, Enterprise Domain Controllers, Creator Owner, Schema Admins, RODCs, `SELF`) and the operator groups AD delegates object create/delete to out of the box (**Account Operators**, Server/Print/Backup Operators — their risk is group membership, not a per-OU delegation). A delegated write scoped to a single benign attribute is also skipped; only object-wide rights and writes to attack-relevant attributes (`gPLink`) are flagged.
+To keep the output to genuine delegations, ACEs held by built-in principals that hold rights on every OU **by default** are not shown — Tier-0 admins (SYSTEM, Administrators, Domain/Enterprise Admins, Domain Controllers, Enterprise Domain Controllers, Creator Owner, Schema Admins, RODCs, `SELF`, Group Policy Creator Owners), the operator groups AD delegates object create/delete to out of the box (**Account Operators**, Server/Print/Backup Operators — their risk is group membership, not a per-OU delegation), and **Key Admins / Enterprise Key Admins**, which carry a standing, inherited `AddKeyCredentialLink` ACE from the domain root by design (Windows Hello for Business) — noise on every OU, not a delegation; the real signal for those two groups is membership (see `--groups`). A delegated write scoped to a single benign attribute is also skipped; only object-wide rights and writes to attack-relevant attributes/rights are flagged.
 
 Rights are aggregated per trustee: a principal that appears in several ACEs (AD often splits `CreateChild` into one object-scoped ACE per child class) is shown once with the union of its rights, marked `(inherited)` only if *every* one of its ACEs is inherited.
 
@@ -156,6 +156,18 @@ Helpdesk Deploy [{AAAA1111-2222-3333-4444-555566667777}]
 
 This matters because **whoever can write a GPO object owns every OU it is linked to** — modifying the GPO runs code on all affected computers and users (the SharpGPOAbuse / pyGPOAbuse path). Unlike an over-permissioned OU, an over-permissioned GPO is otherwise invisible in the tree, and the section also surfaces GPOs that aren't linked anywhere. The same default-principal filter applies, plus **Group Policy Creator Owners** (which holds full control over GPOs it creates by default).
 
+The same analysis is also run against every **Site** object (`CN=Sites,CN=Configuration,…`), which the OU tree search never touches since Sites live in the Configuration partition, not the domain NC:
+
+```
+Sites (Configuration NC) — non-default rights
+Sites: 3  Flagged: 1
+============================================================
+Default-First-Site-Name [CN=Default-First-Site-Name,CN=Sites,CN=Configuration,DC=sevenkingdoms,DC=local]
+    ! WriteGPLink → jon.snow
+```
+
+A site can carry its own `gPLink`, so write access to one is exactly as dangerous as write access to an OU or GPO — link an attacker-controlled GPO to the site and it applies to every computer AD considers part of it (the domain controllers, typically).
+
 Finally, `--acl` reports **who can create new GPOs** (non-default), in a closing section:
 
 ```
@@ -169,7 +181,7 @@ inlanefreight.local
     ! CreateChild → custom-svc
 ```
 
-Creating a GPO requires `CreateChild` on `CN=Policies,CN=System,<domain>`, held by default only by Domain/Enterprise Admins, SYSTEM, and **Group Policy Creator Owners** (GPCO). GPCO is empty by default, so the tool reports two non-default sources: the **transitive members of GPCO** (expanded via `LDAP_MATCHING_RULE_IN_CHAIN`) and any **custom `CreateChild` delegation** on the container (unscoped, or scoped to the `groupPolicyContainer` class). A principal who can create a GPO can then link it wherever they also hold `WriteProperty(gPLink)` — the two findings chain together.
+Creating a GPO requires `CreateChild` on `CN=Policies,CN=System,<domain>`, held by default only by Domain/Enterprise Admins, SYSTEM, and **Group Policy Creator Owners** (GPCO). GPCO is empty by default, so the tool reports two non-default sources: the **transitive members of GPCO** (expanded via `LDAP_MATCHING_RULE_IN_CHAIN`) and any **custom `CreateChild` delegation** on the container (unscoped, or scoped to the `groupPolicyContainer` class). A principal who can create a GPO can then link it wherever they also hold `WriteGPLink` — the two findings chain together.
 
 And it checks the **domain head** for non-default **DCSync** rights:
 
@@ -245,6 +257,7 @@ What each check looks for:
 | **RBCD** | `msDS-AllowedToActOnBehalfOfOtherIdentity` populated; the SD is parsed to list the principals that can act on the resource — compromise one of them to take over the account. |
 | **Secrets in fields** | `description` / `info` / `comment` containing a password keyword — a classic instant win. |
 | **Weak account flags** | `PASSWD_NOTREQD` (may accept an empty password) and reversible-encryption (`0x80`, password recoverable in cleartext) — enabled accounts only, excluding the built-in Guest/krbtgt/DefaultAccount which ship with these flags. |
+| **SID History** | `sIDHistory` populated — leftover privilege from an inter-domain object migration (e.g. ADMT). Not restricted to users: groups and computers can carry it too. Each raw SID is resolved where possible; a SID from a different domain usually can't be, which is itself informative (it shows the migration's origin domain). |
 
 Delegation checks cover both **user and computer** accounts (each is labelled), since constrained delegation on a service *user* account is common; DCs are excluded because their delegation is expected. Roastable accounts that are also `adminCount=1` (privileged) are marked **⭐** — a roastable admin is a crown jewel. `--vuln` is independent of `--acl` and can be combined with it (and with `--gc` for a forest-wide sweep).
 
@@ -261,7 +274,7 @@ Each object is shown once with all of its labels aggregated; objects in containe
 
 ## What can I take over? (`--takeover`)
 
-Every other module reports *non-default* configurations. `--takeover` answers a different, immediately actionable question: **which objects can the account I'm bound as take over, right now?** It resolves your effective token — your own SID plus every group in it (via the DC-computed `tokenGroups`), plus Everyone / Authenticated Users — then pages through **every object in every partition the DC exposes** (the domain NC, **Configuration**, Schema, and the DNS app partitions), parses each `nTSecurityDescriptor`, and keeps only the objects where *your* token is granted a takeover-grade right (`GenericAll`, `WriteDacl`, `WriteOwner`, `GenericWrite`, `CreateChild`, a `gPLink`/all-attribute write, all-extended-rights, or ownership).
+Every other module reports *non-default* configurations. `--takeover` answers a different, immediately actionable question: **which objects can the account I'm bound as take over, right now?** It resolves your effective token — your own SID plus every group in it (via the DC-computed `tokenGroups`), plus Everyone / Authenticated Users — then pages through **every object in every partition the DC exposes** (the domain NC, **Configuration**, Schema, and the DNS app partitions), parses each `nTSecurityDescriptor`, and keeps only the objects where *your* token is granted one of the same takeover-grade rights `--acl` looks for (see above — `GenericAll`, `WriteDacl`, `WriteOwner`, `GenericWrite`, `CreateChild`/`DeleteChild`/`DeleteTree`/`Delete`, `WriteGPLink`/`WriteSPN`/`AddKeyCredentialLink`/`AddAllowedToAct`/`WriteAccountRestrictions`/`AddMember`/`AddSelf`, `ForceChangePassword`, `AllExtendedRights`, or ownership).
 
 Scanning the **Configuration** partition matters: Sites and the entire AD CS configuration live there, not under the domain head. Linking a GPO to a site — e.g. `New-GPLink -Target "Default-First-Site-Name"`, which applies it to every computer in that site (the DCs, typically) — is a `gPLink` write on a Configuration object, so a domain-NC-only scan (or the OU tree) would never show that you can do it. Findings outside the domain NC are tagged with their partition, e.g. `contoso.local (Configuration)`.
 
@@ -290,7 +303,7 @@ inlanefreight.local
 
 | Flag | What you get |
 |------|--------------|
-| `--groups` | Transitive membership (via `LDAP_MATCHING_RULE_IN_CHAIN`) of Domain/Enterprise/Schema Admins, the built-in operators, Cert Publishers, Protected Users, GPCO, and **DnsAdmins** (DLL-load → RCE on a DC). Built-in default members (`Administrator`, the nested admin groups, operators) are filtered out — only *added* principals show, and a group with no added members is omitted. |
+| `--groups` | Transitive membership (via `LDAP_MATCHING_RULE_IN_CHAIN`) of Domain/Enterprise/Schema Admins, the built-in operators, Cert Publishers, Protected Users, GPCO, **Key Admins / Enterprise Key Admins** (both empty by default — a member can `AddKeyCredentialLink`, i.e. Shadow Credentials, on demand), and **DnsAdmins** (DLL-load → RCE on a DC). Built-in default members (`Administrator`, the nested admin groups, operators) are filtered out — only *added* principals show, and a group with no added members is omitted. |
 | `--creds` | **LAPS** local-admin passwords (`ms-Mcs-AdmPwd` / `msLAPS-Password`) and **gMSA** managed passwords — confidential attributes only come back when *you* can read them, so anything shown is a credential you can use. Non-readable LAPS hosts are summarised; for gMSAs you can't read, the authorised readers are listed as onward targets. |
 | `--trusts` | Domain/forest trusts with direction (`← → ↔`), type, and `trustAttributes` flags (within-forest, forest-transitive, SID-filtering, non-transitive, …). |
 | `--computers` | Full computer inventory (hostname, OS, last logon) flagging **EOL OSes** and **stale** accounts (>90 days). |
@@ -310,7 +323,7 @@ Vulnerable templates: 1
 
 Each `pKICertificateTemplate` is evaluated from LDAP alone: **ESC1** (enrollee supplies the subject + an authentication EKU + no manager approval + no RA signature + a non-admin can enroll), **ESC2** (Any-Purpose EKU), **ESC3** (Enrollment-Agent EKU), **ESC4** (a **low-privileged** principal has object-wide write — GenericAll/GenericWrite/WriteDacl/WriteOwner — over the template), and **ESC9** (`CT_FLAG_NO_SECURITY_EXTENSION`). "Enrollable by" and "writable by" come from parsing each template's DACL (the `Certificate-Enrollment` extended right).
 
-ESC4 and the ESC7 CA-object check are deliberately restricted to **low-privileged** trustees (Everyone / Authenticated Users / Domain Users / Domain Computers / Users). Admins and the CA's own host machine account hold these rights on the built-in templates *by default*, so flagging them would bury real findings in noise — a single-attribute `WriteProperty` is likewise not treated as ESC4. The trade-off: a delegation to a **custom** (non-low-priv) group won't show; run [Certipy](https://github.com/ly4k/Certipy) for exhaustive template-ACL analysis, and to confirm/exploit ESC6/ESC8/ESC11 (which depend on CA registry / HTTP / RPC state and aren't LDAP-observable).
+ESC4 and the ESC7 CA-object check are deliberately restricted to **low-privileged** trustees (Everyone / Authenticated Users / Domain Users / Domain Computers / Users). Admins and the CA's own host machine account hold these rights on the built-in templates *by default*, so flagging them would bury real findings in noise — a single-attribute `WriteProperty` is likewise not treated as ESC4, with one exception: a low-priv principal holding a scoped write to just `msPKI-Certificate-Name-Flag` or `msPKI-Enrollment-Flag` can flip the exact bits ESC1/ESC9 check without needing full control of the template, so it's still flagged as ESC4 and reported separately as `flag-writable by`, distinct from `writable by`. The trade-off: a delegation to a **custom** (non-low-priv) group won't show; run [Certipy](https://github.com/ly4k/Certipy) for exhaustive template-ACL analysis, and to confirm/exploit ESC6/ESC8/ESC11 (which depend on CA registry / HTTP / RPC state and aren't LDAP-observable).
 
 > The modules that parse security descriptors (`--acl`, `--object-acls`, `--adcs`, `--takeover`) need impacket; the rest are pure LDAP reads.
 
